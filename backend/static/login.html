@@ -8,32 +8,58 @@
   * { margin:0; padding:0; box-sizing:border-box; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
   body {
     min-height:100vh; display:flex; align-items:center; justify-content:center;
-    background: linear-gradient(135deg, #1e3a8a 0%, #0f172a 100%); color:#e2e8f0;
+    background: radial-gradient(ellipse at top, #1e3a8a 0%, #0f172a 60%);
+    color:#e2e8f0;
+    overflow:hidden;
+  }
+  body::before {
+    content:""; position:fixed; inset:0;
+    background: radial-gradient(circle at 20% 80%, rgba(168,85,247,.15), transparent 40%),
+                radial-gradient(circle at 80% 20%, rgba(96,165,250,.15), transparent 40%);
+    pointer-events:none;
   }
   .box {
-    background:#1e293b; padding:36px 32px; border-radius:12px;
-    width:360px; box-shadow:0 10px 40px rgba(0,0,0,.35);
+    background: rgba(30,41,59,.85);
+    padding:40px 36px; border-radius:16px;
+    width:380px; box-shadow: 0 20px 60px rgba(0,0,0,.5);
+    border:1px solid rgba(96,165,250,.2);
+    backdrop-filter: blur(16px);
+    position:relative; z-index:1;
   }
-  h1 { font-size:20px; margin-bottom:6px; background:linear-gradient(90deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent; }
-  .sub { font-size:12px; color:#94a3b8; margin-bottom:24px; }
-  label { display:block; font-size:12px; color:#94a3b8; margin:14px 0 6px; }
+  h1 { font-size:22px; margin-bottom:6px;
+       background:linear-gradient(90deg,#60a5fa,#a78bfa,#f472b6);
+       -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+       background-size: 200% auto;
+       animation: shift 6s linear infinite; }
+  @keyframes shift { to { background-position: 200% center; } }
+  .sub { font-size:12px; color:#94a3b8; margin-bottom:28px; }
+  label { display:block; font-size:12px; color:#94a3b8; margin:16px 0 6px; font-weight:500; }
   input {
-    width:100%; padding:10px 12px; background:#0f172a; color:#e2e8f0;
-    border:1px solid #334155; border-radius:6px; font-size:14px;
+    width:100%; padding:11px 13px; background:#0f172a; color:#e2e8f0;
+    border:1px solid #334155; border-radius:7px; font-size:14px;
+    transition: border-color .15s ease, box-shadow .15s ease;
   }
-  input:focus { outline:none; border-color:#60a5fa; }
+  input:focus { outline:none; border-color:#60a5fa; box-shadow: 0 0 0 3px rgba(96,165,250,.15); }
   button {
-    width:100%; margin-top:22px; padding:11px; font-size:14px; font-weight:500;
-    background:#3b82f6; color:white; border:none; border-radius:6px; cursor:pointer;
+    width:100%; margin-top:24px; padding:12px; font-size:14px; font-weight:600;
+    background:linear-gradient(135deg,#3b82f6,#6366f1);
+    color:white; border:none; border-radius:7px; cursor:pointer;
+    box-shadow: 0 4px 14px rgba(59,130,246,.35);
+    transition: all .15s ease;
   }
-  button:hover { background:#2563eb; }
-  button:disabled { opacity:.5; cursor:not-allowed; }
-  .err { margin-top:14px; font-size:12px; color:#fca5a5; background:#450a0a; padding:8px 10px; border-radius:4px; display:none; }
+  button:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(59,130,246,.5); }
+  button:active { transform: translateY(0); }
+  button:disabled { opacity:.5; cursor:not-allowed; transform:none; box-shadow:none; }
+  .err { margin-top:14px; font-size:12px; color:#fca5a5; background:#450a0a; padding:10px 12px; border-radius:6px; display:none; border-left:3px solid #ef4444; }
   .hint {
-    margin-top:20px; padding:10px 12px; font-size:11px; color:#94a3b8;
-    background:#0f172a; border-radius:6px; border:1px solid #334155;
+    margin-top:22px; padding:12px 14px; font-size:11.5px; color:#94a3b8;
+    background:rgba(15,23,42,.5); border-radius:8px; border:1px solid #334155;
+    line-height:1.8;
   }
-  .hint code { color:#fbbf24; }
+  .hint b { color:#cbd5e1; }
+  .hint code { color:#fbbf24; background:#0b1020; padding:1px 6px; border-radius:3px; font-size:11px; }
+  .role-row { display:flex; gap:8px; align-items:center; margin-top:4px; }
+  .role-label { width:50px; color:#64748b; flex-shrink:0; }
 </style>
 </head>
 <body>
@@ -52,9 +78,10 @@
   <div class="err" id="err"></div>
 
   <div class="hint">
-    <b>测试账号</b>（密码: <code>test123</code>）<br>
-    我方: <code>alice</code> / <code>bob</code> / <code>carol</code><br>
-    加工方: <code>huaxinze</code> / <code>yuanmao</code>
+    <b>测试账号</b>（密码: <code>test123</code>）
+    <div class="role-row"><span class="role-label">我方</span><code>alice</code> / <code>bob</code> / <code>carol</code> / <code>dave</code></div>
+    <div class="role-row"><span class="role-label">加工方</span><code>huaxinze</code> / <code>yuanmao</code></div>
+    <div class="role-row"><span class="role-label">材料方</span><code>baogang</code> / <code>xinsheng</code></div>
   </div>
 </div>
 
@@ -91,6 +118,8 @@ async function doLogin(ev) {
       window.location.href = '/static/internal/home.html';
     } else if (data.tenant_type === 'processor') {
       window.location.href = '/static/processor/home.html';
+    } else if (data.tenant_type === 'material') {
+      window.location.href = '/static/material/home.html';
     } else {
       err.textContent = '不支持的租户类型: ' + data.tenant_type;
       err.style.display = 'block';

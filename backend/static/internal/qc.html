@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>质检 - MVP</title>
+<link rel="stylesheet" href="/static/common.css">
+<style>
+.tabs { display:flex; gap:4px; border-bottom:2px solid #334155; margin-bottom:16px; }
+.tab  { padding:10px 16px; cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-2px; color:#94a3b8; font-size:14px; }
+.tab.active { border-bottom-color:#60a5fa; color:#60a5fa; font-weight:600; }
+.stats { display:flex; gap:12px; margin-bottom:14px; }
+.stat  { flex:1; background:#0f172a; border:1px solid #334155; padding:12px; border-radius:8px; text-align:center; }
+.stat b { font-size:22px; display:block; color:#60a5fa; }
+.stat span { font-size:11px; color:#94a3b8; }
+.severity-critical { background:#7f1d1d; color:#fca5a5; padding:3px 10px; border-radius:4px; font-size:11px; font-weight:600; }
+.severity-high     { background:#7c2d12; color:#fdba74; padding:3px 10px; border-radius:4px; font-size:11px; font-weight:600; }
+.severity-medium   { background:#78350f; color:#fcd34d; padding:3px 10px; border-radius:4px; font-size:11px; font-weight:600; }
+.severity-low      { background:#0e7490; color:#67e8f9; padding:3px 10px; border-radius:4px; font-size:11px; font-weight:600; }
+.ai-box {
+  background:linear-gradient(135deg, rgba(96,165,250,.06), rgba(167,139,250,.06));
+  border:1px solid #3b5278; border-radius:10px;
+  padding:18px; margin:14px 0;
+  position:relative;
+}
+.ai-box::before {
+  content:"🤖"; position:absolute; top:-14px; left:16px;
+  background:#1e293b; padding:2px 8px; border-radius:4px;
+  font-size:16px; border:1px solid #3b5278;
+}
+.ai-box h4 { color:#60a5fa; font-size:13px; margin-bottom:10px; font-weight:600; }
+.ai-label  { font-size:10px; color:#94a3b8; margin:10px 0 3px; text-transform:uppercase; letter-spacing:.4px; font-weight:600; }
+.ai-box .ai-label + div { font-size:13px; color:#e2e8f0; }
+.confidence-bar { display:inline-flex; align-items:center; gap:6px; font-size:11px; color:#94a3b8; }
+.confidence-bar .bar {
+  display:inline-block; width:80px; height:5px; background:#2d3e58;
+  border-radius:3px; overflow:hidden;
+}
+.confidence-bar .bar > div { height:100%; background:linear-gradient(90deg,#60a5fa,#34d399); }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><a href="/static/internal/home.html" style="color:inherit;">🏢 模具委外采购系统</a> &nbsp;›&nbsp; <span style="color:#e2e8f0;">质检</span></div>
+  <div class="user">
+    <span class="badge">internal</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="tabs">
+    <div class="tab active" data-tab="pending">📋 待质检</div>
+    <div class="tab" data-tab="inspections">📝 质检历史</div>
+    <div class="tab" data-tab="exceptions">⚠️ 异常处理</div>
+  </div>
+
+  <!-- 待质检 -->
+  <div class="panel" data-panel="pending">
+    <div class="card">
+      <div class="stats" id="pendStats">
+        <div class="stat"><b id="ps_total">0</b><span>总计</span></div>
+        <div class="stat"><b id="ps_outsource">0</b><span>外协件</span></div>
+        <div class="stat"><b id="ps_material">0</b><span>来料</span></div>
+        <div class="stat"><b id="ps_internal">0</b><span>自制件</span></div>
+      </div>
+      <table>
+        <thead><tr>
+          <th>项目</th><th>来源</th><th>单号</th><th>供应商</th>
+          <th>数量</th><th>就绪时间</th><th>操作</th>
+        </tr></thead>
+        <tbody id="pendBody"><tr><td colspan="7" class="empty">加载中...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 质检历史 -->
+  <div class="panel" data-panel="inspections" style="display:none;">
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>单号</th><th>项目</th><th>来源</th><th>结果</th>
+          <th>样本/不良</th><th>缺陷类型</th><th>质检员</th><th>时间</th>
+        </tr></thead>
+        <tbody id="inspBody"><tr><td colspan="8" class="empty">—</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 异常 -->
+  <div class="panel" data-panel="exceptions" style="display:none;">
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>异常号</th><th>项目</th><th>严重度</th><th>缺陷</th>
+          <th>状态</th><th>路径</th><th>创建时间</th><th>操作</th>
+        </tr></thead>
+        <tbody id="excBody"><tr><td colspan="8" class="empty">—</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<!-- 质检录入 modal -->
+<div class="modal-bg" id="inspModal">
+  <div class="modal" style="max-width:620px;">
+    <h3>📝 录入质检</h3>
+    <div class="muted" id="inspInfo" style="margin-bottom:10px;"></div>
+    <form onsubmit="return submitInsp(event)">
+      <div class="flex">
+        <div class="flex-grow">
+          <label>结果 *</label>
+          <select name="result" required>
+            <option value="pass">pass 合格</option>
+            <option value="fail">fail 不合格（将触发异常）</option>
+            <option value="concession">concession 让步接收</option>
+          </select>
+        </div>
+        <div class="flex-grow">
+          <label>样本数 *</label>
+          <input name="sample_qty" type="number" min="1" value="10" required>
+        </div>
+        <div class="flex-grow">
+          <label>不良数</label>
+          <input name="defect_qty" type="number" min="0" value="0">
+        </div>
+      </div>
+      <label>缺陷类型（fail 时必填）</label>
+      <select name="defect_type">
+        <option value="">无</option>
+        <optgroup label="加工方责任">
+          <option>尺寸超差</option><option>外观缺陷</option><option>划伤</option>
+          <option>磕碰</option><option>热处理不均</option><option>表面处理缺陷</option>
+          <option>粗糙度不达标</option>
+        </optgroup>
+        <optgroup label="材料方责任">
+          <option>材料批次不良</option><option>材质不符</option>
+          <option>材料尺寸超差</option><option>材料硬度异常</option>
+        </optgroup>
+        <optgroup label="我方责任">
+          <option>图纸错误</option><option>工艺设计错误</option>
+        </optgroup>
+        <optgroup label="客户">
+          <option>客户变更</option>
+        </optgroup>
+      </select>
+      <label>备注</label>
+      <textarea name="notes" rows="2"></textarea>
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeInsp()">取消</button>
+        <button type="submit" class="primary">提交质检</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- 异常详情 modal -->
+<div class="modal-bg" id="excModal">
+  <div class="modal" style="max-width:720px;">
+    <h3 id="excTitle">异常详情</h3>
+    <div id="excBody2">加载中...</div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('internal');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+
+  function toast(msg, err=false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast show ' + (err?'error':'success');
+    setTimeout(() => t.className = 'toast', 2500);
+  }
+
+  // tabs
+  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.querySelectorAll('.panel').forEach(p => p.style.display = p.dataset.panel === t.dataset.tab ? '' : 'none');
+    const loaders = { pending: loadPend, inspections: loadInsp, exceptions: loadExc };
+    (loaders[t.dataset.tab] || (()=>{}))();
+  }));
+
+  // ---- 待质检 ----
+  async function loadPend() {
+    const r = await App.api('/api/internal/qc/pending');
+    document.getElementById('ps_total').textContent = r.stats.total;
+    document.getElementById('ps_outsource').textContent = r.stats.outsource;
+    document.getElementById('ps_material').textContent = r.stats.material;
+    document.getElementById('ps_internal').textContent = r.stats.internal_production;
+
+    const subjectMap = { outsource:'外协件', material:'来料', internal_production:'自制件', final:'成品' };
+    const body = document.getElementById('pendBody');
+    if (!r.items.length) {
+      body.innerHTML = `<tr><td colspan="7" class="empty">✓ 没有待质检项</td></tr>`; return;
+    }
+    body.innerHTML = r.items.map(x => `<tr>
+      <td>${App.esc(x.project_no)} · ${App.esc(x.project_name)}</td>
+      <td><span class="badge">${subjectMap[x.subject_type] || x.subject_type}</span></td>
+      <td><code>${App.esc(x.order_no)}</code></td>
+      <td>${App.esc(x.supplier_name || '—')}</td>
+      <td>${x.quantity || '—'}</td>
+      <td class="muted">${App.fmtDate(x.ready_at)}</td>
+      <td><button class="primary" onclick='openInsp(${JSON.stringify(x).replace(/'/g,"\\'")})'>录入</button></td>
+    </tr>`).join('');
+  }
+
+  // ---- 质检历史 ----
+  async function loadInsp() {
+    const r = await App.api('/api/internal/qc/inspections');
+    const body = document.getElementById('inspBody');
+    if (!r.items.length) { body.innerHTML = `<tr><td colspan="8" class="empty">—</td></tr>`; return; }
+    const resMap = { pass:'✓合格', fail:'❌不合格', concession:'⚠让步' };
+    body.innerHTML = r.items.map(i => `<tr>
+      <td><code>${App.esc(i.inspection_no)}</code></td>
+      <td>${App.esc(i.project_no)}</td>
+      <td>${App.esc(i.subject_type)}</td>
+      <td>${resMap[i.result] || i.result}</td>
+      <td>${i.sample_qty}/${i.defect_qty}</td>
+      <td>${App.esc(i.defect_type || '—')}</td>
+      <td>${App.esc(i.inspector_name || '—')}</td>
+      <td class="muted">${App.fmtDate(i.inspected_at)}</td>
+    </tr>`).join('');
+  }
+
+  // ---- 异常 ----
+  async function loadExc() {
+    const r = await App.api('/api/internal/qc/exceptions');
+    const body = document.getElementById('excBody');
+    if (!r.items.length) { body.innerHTML = `<tr><td colspan="8" class="empty">—</td></tr>`; return; }
+    body.innerHTML = r.items.map(e => `<tr>
+      <td><code>${App.esc(e.exception_no)}</code></td>
+      <td>${App.esc(e.project_no)}</td>
+      <td><span class="severity-${e.severity}">${e.severity}</span></td>
+      <td>${App.esc(e.exception_type || '—')}</td>
+      <td><span class="badge">${e.status}</span></td>
+      <td>${App.esc(e.resolution_path || '—')}</td>
+      <td class="muted">${App.fmtDate(e.created_at)}</td>
+      <td><button class="secondary" onclick="openExc(${e.id})">详情</button></td>
+    </tr>`).join('');
+  }
+
+  // ---- 录入 ----
+  let _pendContext = null;
+  window.openInsp = (ctx) => {
+    _pendContext = ctx;
+    document.getElementById('inspInfo').innerHTML = `
+      <b>${App.esc(ctx.project_no)}</b> · ${App.esc(ctx.subject_type)} ·
+      ${App.esc(ctx.order_no)} ${ctx.supplier_name ? '· ' + App.esc(ctx.supplier_name) : ''}
+    `;
+    document.querySelector('#inspModal form').reset();
+    document.querySelector('#inspModal form').elements['sample_qty'].value = 10;
+    document.getElementById('inspModal').classList.add('show');
+  };
+  window.closeInsp = () => document.getElementById('inspModal').classList.remove('show');
+
+  window.submitInsp = async (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const body = {
+      project_id: _pendContext.project_id,
+      subject_type: _pendContext.subject_type,
+      subject_id: _pendContext.subject_id,
+      result: fd.get('result'),
+      sample_qty: parseInt(fd.get('sample_qty')) || 1,
+      defect_qty: parseInt(fd.get('defect_qty')) || 0,
+      defect_type: fd.get('defect_type') || null,
+      notes: fd.get('notes') || null,
+    };
+    try {
+      const r = await App.api('/api/internal/qc/inspections', { method:'POST', body });
+      if (r.exception_id) {
+        toast(`✓ 已录入，自动生成异常单 #${r.exception_id}`);
+      } else {
+        toast('✓ 质检完成');
+      }
+      closeInsp();
+      loadPend();
+      // 若有异常，自动弹详情
+      if (r.exception_id) setTimeout(() => openExc(r.exception_id), 600);
+    } catch (e) { toast('❌ ' + e.message, true); }
+    return false;
+  };
+
+  // ---- 异常详情 + 确认责任 ----
+  window.openExc = async (eid) => {
+    document.getElementById('excModal').classList.add('show');
+    document.getElementById('excBody2').textContent = '加载中...';
+    try {
+      const d = await App.api('/api/internal/qc/exceptions/' + eid);
+      const e = d.exception;
+      const ai = e.ai_analysis || {};
+      document.getElementById('excTitle').textContent = `${e.exception_no}`;
+
+      const canConfirm = e.status === 'ai_analyzed';
+      const canUpgrade = e.status === 'responsibility_confirmed';
+      const canResolve = e.status === 'responsibility_confirmed';
+      const canAppendResp = e.status !== 'resolved' && e.status !== 'closed';
+      const canUpload = e.status !== 'resolved' && e.status !== 'closed';
+      const respHtml = d.responsibility.length
+        ? d.responsibility.map(r => `<li>${App.esc(r.responsible_party)} ${r.responsibility_ratio}% ${r.responsible_tenant_name ? ' - ' + App.esc(r.responsible_tenant_name) : ''}</li>`).join('')
+        : '<li class="muted">暂无</li>';
+      const reworkHtml = d.rework_orders.length
+        ? d.rework_orders.map(r => `<li><code>${App.esc(r.rework_no)}</code> type=${r.rework_type} status=${r.status}</li>`).join('')
+        : '<li class="muted">未生成</li>';
+
+      document.getElementById('excBody2').innerHTML = `
+        <div><b>项目</b>: <code>${App.esc(e.project_no)}</code> · ${App.esc(e.project_name)}</div>
+        <div><b>严重度</b>: <span class="severity-${e.severity}">${e.severity}</span>
+             &nbsp; <b>状态</b>: <span class="badge">${e.status}</span></div>
+        <div><b>质检单</b>: ${App.esc(e.inspection_no || '—')} · 不良 ${e.defect_qty}/${e.sample_qty} · 缺陷 ${App.esc(e.insp_defect_type || '—')}</div>
+        <div><b>描述</b>: ${App.esc(e.description || '—')}</div>
+
+        <div class="ai-box">
+          <h4 style="margin-left:28px;">AI 分析报告 <span class="confidence-bar">· 置信度 <span class="bar"><div style="width:${((ai.confidence||0)*100).toFixed(0)}%"></div></span> ${((ai.confidence||0)*100).toFixed(0)}%</span></h4>
+          <div class="ai-label">根因推断</div><div>${App.esc(ai.probable_cause || '—')}</div>
+          <div class="ai-label">建议责任方</div><div><b style="color:#fbbf24;">${App.esc(ai.suggested_party || '—')}</b> <span class="muted">（承担 ${ai.suggested_ratio}%）</span></div>
+          <div class="ai-label">建议处理路径</div><div><b>${App.esc(ai.suggested_path || '—')}</b></div>
+          <div class="ai-label">推理链</div><div class="muted" style="font-size:11px;">${App.esc(ai.reasoning || '—')}</div>
+          <div class="ai-label">证据清单</div><div>${(ai.evidence_required || []).map(x=>'<span class="badge ghost" style="margin-right:4px;">'+App.esc(x)+'</span>').join(' ')}</div>
+        </div>
+
+        <div><b>证据包</b>:</div>
+        <ul style="margin-left:20px;">${
+          d.evidence.length
+            ? d.evidence.map(ev => `<li>${App.esc(ev.evidence_type)} · ${App.esc(ev.description || '—')} <span class="muted">(${App.esc(ev.source)})</span></li>`).join('')
+            : '<li class="muted">暂无</li>'
+        }</ul>
+
+        <div><b>责任判定</b>:</div>
+        <ul style="margin-left:20px;">${respHtml}</ul>
+
+        <div><b>重工/补料单</b>:</div>
+        <ul style="margin-left:20px;">${reworkHtml}</ul>
+
+        ${canConfirm ? `
+          <div class="ai-box" style="border-color:#f59e0b; margin-top:16px;">
+            <h4 style="color:#f59e0b;">✍️ 确认责任（采纳 AI 建议或自行调整）</h4>
+            <form onsubmit="return confirmExc(event, ${eid})">
+              <div class="flex">
+                <div class="flex-grow">
+                  <label>责任方</label>
+                  <select name="responsible_party">
+                    <option value="material_supplier" ${ai.suggested_party==='material_supplier'?'selected':''}>material_supplier 材料方</option>
+                    <option value="processor"         ${ai.suggested_party==='processor'?'selected':''}>processor 加工方</option>
+                    <option value="internal"          ${ai.suggested_party==='internal'?'selected':''}>internal 我方</option>
+                    <option value="customer"          ${ai.suggested_party==='customer'?'selected':''}>customer 客户</option>
+                    <option value="shared"            ${ai.suggested_party==='shared'?'selected':''}>shared 共担</option>
+                  </select>
+                </div>
+                <div class="flex-grow">
+                  <label>处理路径</label>
+                  <select name="resolution_path">
+                    <option value="rework_material" ${ai.suggested_path==='rework_material'?'selected':''}>rework_material 退换料</option>
+                    <option value="rework_process"  ${ai.suggested_path==='rework_process'?'selected':''}>rework_process 重工</option>
+                    <option value="concession"      ${ai.suggested_path==='concession'?'selected':''}>concession 让步接收</option>
+                    <option value="claim"           ${ai.suggested_path==='claim'?'selected':''}>claim 索赔</option>
+                  </select>
+                </div>
+                <div style="width:120px;">
+                  <label>比例 %</label>
+                  <input name="responsibility_ratio" type="number" min="0" max="100" value="${ai.suggested_ratio || 100}">
+                </div>
+              </div>
+              <label>备注</label>
+              <input name="reason">
+              <div style="margin-top:12px; display:flex; justify-content:flex-end;">
+                <button type="submit" class="primary" style="background:#10b981;">✅ 确认 → 生成 rework</button>
+              </div>
+            </form>
+          </div>` : ''
+        }
+
+        <div style="margin-top:14px; text-align:right;">
+          ${canResolve ? `<button class="primary" style="background:#10b981;" onclick="resolveExc(${eid})">✓ 标记已解决</button>` : ''}
+          ${canUpgrade ? `
+            <button class="secondary" onclick="upgradePath(${eid}, '${App.esc(e.resolution_path)}')">⇄ 变更路径</button>
+          ` : ''}
+          ${canUpload ? `
+            <button class="secondary" onclick="uploadEvidence(${eid})">📎 上传证据</button>
+          ` : ''}
+          <button class="secondary" onclick="closeExc()">关闭</button>
+        </div>
+      `;
+    } catch (e) { toast('❌ ' + e.message, true); }
+  };
+  window.closeExc = () => document.getElementById('excModal').classList.remove('show');
+
+  window.confirmExc = async (ev, eid) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const body = {
+      responsible_party: fd.get('responsible_party'),
+      resolution_path:   fd.get('resolution_path'),
+      responsibility_ratio: parseFloat(fd.get('responsibility_ratio')) || 100,
+      reason: fd.get('reason') || null,
+    };
+    try {
+      const r = await App.api(`/api/internal/qc/exceptions/${eid}/confirm`, { method:'POST', body });
+      toast(`✓ 已确认，rework #${r.rework_order_id || '-'}`);
+      openExc(eid);
+      loadExc();
+    } catch (e) { toast('❌ ' + e.message, true); }
+    return false;
+  };
+
+  window.resolveExc = async (eid) => {
+    if (!confirm('标记异常为 resolved 状态？需所有 rework 单已完成')) return;
+    try {
+      await App.api(`/api/internal/qc/exceptions/${eid}/resolve`, { method:'POST' });
+      toast('✓ 异常已解决');
+      openExc(eid); loadExc();
+    } catch (e) { toast('❌ ' + e.message, true); }
+  };
+
+  window.upgradePath = async (eid, old_path) => {
+    const choices = ['rework_material', 'rework_process', 'concession', 'claim'];
+    const picked = prompt(`当前 ${old_path}。新路径（${choices.join(' / ')}）：`, old_path);
+    if (!picked || !choices.includes(picked)) return;
+    const reason = prompt('变更原因：') || '';
+    try {
+      await App.api(`/api/internal/qc/exceptions/${eid}/path`, {
+        method: 'PATCH',
+        body: { resolution_path: picked, reason },
+      });
+      toast(`✓ 已变更：${old_path} → ${picked}`);
+      openExc(eid); loadExc();
+    } catch (e) { toast('❌ ' + e.message, true); }
+  };
+
+  window.uploadEvidence = async (eid) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.onchange = async () => {
+      const file = input.files[0]; if (!file) return;
+      const type = prompt('证据类型 (drawing/inspection_report/photo/waybill/iqc_report/other):', 'photo') || 'photo';
+      const desc = prompt('描述（可选）：') || '';
+      const fd = new FormData();
+      fd.append('file', file);
+      fd.append('evidence_type', type);
+      fd.append('description', desc);
+      try {
+        await App.api(`/api/internal/qc/exceptions/${eid}/evidence/upload`, {
+          method: 'POST', body: fd,
+        });
+        toast('✓ 证据已上传');
+        openExc(eid);
+      } catch (e) { toast('❌ ' + e.message, true); }
+    };
+    input.click();
+  };
+
+  loadPend();
+})();
+</script>
+</body>
+</html>

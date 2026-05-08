@@ -19,5 +19,7 @@ async def home(user: CurrentUser = Depends(get_current_user)):
         return RedirectResponse(url="/static/internal/home.html", status_code=302)
     elif user.tenant_type == "processor":
         return RedirectResponse(url="/static/processor/home.html", status_code=302)
+    elif user.tenant_type == "material":
+        return RedirectResponse(url="/static/material/home.html", status_code=302)
     else:
         return RedirectResponse(url="/static/login.html", status_code=302)

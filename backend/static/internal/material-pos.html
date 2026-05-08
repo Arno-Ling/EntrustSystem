@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>材料采购单 - MVP</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><a href="/static/internal/home.html" style="color:inherit;">🏢 模具委外采购系统</a> &nbsp;›&nbsp; <span style="color:#e2e8f0;">材料采购单</span></div>
+  <div class="user">
+    <span class="badge">internal</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+      <h2 style="margin:0;">📦 给材料方的采购单</h2>
+      <button class="primary" onclick="openCreate()">+ 新建采购单</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th>单号</th><th>项目</th><th>供应商</th><th>材料</th><th>规格</th>
+        <th>数量</th><th>单价</th><th>金额</th><th>状态</th><th>操作</th>
+      </tr></thead>
+      <tbody id="poBody"><tr><td colspan="10" class="empty">加载中...</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card" id="detailCard" style="display:none;">
+    <h2 id="detailTitle">采购单详情</h2>
+    <div id="detailContent"></div>
+  </div>
+</main>
+
+<!-- Create PO modal -->
+<div class="modal-bg" id="createModal">
+  <div class="modal" style="background:#1e293b; padding:24px; border-radius:10px; width:600px;">
+    <h3>新建材料采购单</h3>
+    <form onsubmit="return submitCreate(event)">
+      <div style="display:flex; gap:12px;">
+        <div style="flex:2;">
+          <label>项目 *</label>
+          <select name="project_id" id="projSel" required></select>
+        </div>
+        <div style="flex:2;">
+          <label>材料方 *</label>
+          <select name="supplier_id" id="supSel" required></select>
+        </div>
+      </div>
+      <div style="display:flex; gap:12px;">
+        <div style="flex:2;">
+          <label>材料号 *</label>
+          <input name="material_code" required placeholder="Cr12MoV">
+        </div>
+        <div style="flex:2;">
+          <label>规格</label>
+          <input name="spec" placeholder="200x100x50">
+        </div>
+      </div>
+      <div style="display:flex; gap:12px;">
+        <div style="flex:1;"><label>数量 *</label><input name="qty" type="number" step="0.1" required></div>
+        <div style="flex:1;"><label>单位</label><input name="unit" value="kg"></div>
+        <div style="flex:1;"><label>单价</label><input name="unit_price" type="number" step="0.01"></div>
+      </div>
+      <label>需求到货日期</label>
+      <input name="required_date" type="date">
+      <label>备注</label>
+      <input name="remark">
+      <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:16px;">
+        <button type="button" class="secondary" onclick="closeCreate()">取消</button>
+        <button type="submit" class="primary">创建（自动应用 MOQ 规则）</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div id="toast" style="position:fixed; bottom:30px; right:30px; padding:10px 20px; border-radius:5px; display:none; z-index:200;"></div>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('internal');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+
+  function toast(msg, err=false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.style.display = 'block';
+    t.style.background = err ? '#7f1d1d' : '#065f46';
+    t.style.color = err ? '#fca5a5' : '#6ee7b7';
+    setTimeout(() => t.style.display = 'none', 2500);
+  }
+
+  async function loadPOs() {
+    const r = await App.api('/api/internal/material-pos');
+    const body = document.getElementById('poBody');
+    if (!r.items.length) { body.innerHTML = `<tr><td colspan="10" class="empty">暂无采购单</td></tr>`; return; }
+    body.innerHTML = r.items.map(po => {
+      const surplus = po.moq_surplus_qty > 0
+        ? `<br><span style="font-size:10px; color:#f59e0b;">⚠ MOQ +${po.moq_surplus_qty}</span>` : '';
+      return `<tr>
+        <td><code>${App.esc(po.po_no)}</code></td>
+        <td>${App.esc(po.project_no)} · ${App.esc(po.project_name)}</td>
+        <td>${App.esc(po.supplier_name)}</td>
+        <td><b>${App.esc(po.material_code)}</b></td>
+        <td>${App.esc(po.spec || '—')}</td>
+        <td>${po.qty}${po.unit}${surplus}</td>
+        <td>${po.unit_price != null ? '¥' + po.unit_price.toFixed(2) : '—'}</td>
+        <td>${po.total_amount != null ? '¥' + po.total_amount.toFixed(2) : '—'}</td>
+        <td><span class="badge ${po.status}">${po.status}</span></td>
+        <td>${po.status === 'shipped'
+              ? `<button class="primary" onclick="openReceive(${po.id})">确认收货</button>`
+              : `<button class="secondary" onclick="viewDetail(${po.id})">查看</button>`}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function loadOptions() {
+    // project options
+    const projs = await App.api('/api/internal/projects?page_size=50');
+    const projSel = document.getElementById('projSel');
+    projSel.innerHTML = projs.items.map(p => `<option value="${p.id}">${App.esc(p.project_no)} · ${App.esc(p.name)}</option>`).join('');
+    // supplier (material) options — 直接走 /material-pos?supplier_id... 不行，简化：查一遍所有 tenants material 类型的 supplier
+    // 通过 basis alerts 或直接请求一个小 API — 这里复用 suppliers: 先用查询 tenants 接口是不够的
+    // 最简单：拉 /basis/moq-rules 取 supplier 字段 / 或查 /api/internal/basis/inventory 不涉及；
+    // 实际要一个独立接口。暂时从 material_prices 里凑：
+    const mp = await App.api('/api/internal/basis/material-prices?only_active=true');
+    const seen = new Map();
+    mp.items.forEach(m => { if (m.supplier_id && !seen.has(m.supplier_id)) seen.set(m.supplier_id, m.supplier_name); });
+    if (seen.size === 0) {
+      // 退而求其次：手工输入 supplier_id 模式
+      document.getElementById('supSel').outerHTML = '<input name="supplier_id" type="number" placeholder="材料方 supplier_id" required>';
+      return;
+    }
+    document.getElementById('supSel').innerHTML = Array.from(seen.entries()).map(([id, name]) =>
+      `<option value="${id}">${App.esc(name)}</option>`
+    ).join('');
+  }
+
+  window.openCreate = async () => {
+    await loadOptions();
+    document.getElementById('createModal').style.display = 'flex';
+  };
+  window.closeCreate = () => document.getElementById('createModal').style.display = 'none';
+
+  window.submitCreate = async (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const body = {};
+    fd.forEach((v, k) => {
+      if (v === '') return;
+      if (['project_id','supplier_id'].includes(k)) body[k] = parseInt(v);
+      else if (['qty','unit_price'].includes(k)) body[k] = parseFloat(v);
+      else body[k] = v;
+    });
+    try {
+      const r = await App.api('/api/internal/material-pos', { method:'POST', body });
+      toast(`✓ 采购单 ${r.po_no} 已创建。MOQ 调整：${r.qty} / 余量 ${r.moq_surplus_qty}`);
+      closeCreate();
+      loadPOs();
+    } catch (e) { toast('❌ ' + e.message, true); }
+    return false;
+  };
+
+  window.viewDetail = (po_id) => toast(`详情页在后续版本；PO id=${po_id}`);
+
+  window.openReceive = async (po_id) => {
+    // 查 shipments
+    const r = await App.api('/api/internal/material-pos?project_id=' + 0);  // 不够；改调 material/pos/{id}
+    // MVP: 直接用浏览器 prompt
+    const sh_input = prompt('输入 shipment_id（来自材料方发货记录）：');
+    if (!sh_input) return;
+    const shipment_id = parseInt(sh_input);
+    if (!shipment_id) return toast('❌ 无效 shipment_id', true);
+    try {
+      const rr = await App.api(`/api/internal/material-pos/${po_id}/receive`, {
+        method: 'POST',
+        body: { shipment_id },
+      });
+      toast(`✓ 已收货 ${rr.received_qty}，MOQ 入库=${rr.moq_surplus_stocked}`);
+      loadPOs();
+    } catch (e) { toast('❌ ' + e.message, true); }
+  };
+
+  loadPOs();
+})();
+</script>
+</body>
+</html>

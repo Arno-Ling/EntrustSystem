@@ -11,9 +11,12 @@
 <header class="topbar">
   <div class="brand">🏢 模具委外采购系统 - 我方视角</div>
   <div class="user">
+    <a href="/static/internal/kanban.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">📊 看板</a>
     <a href="/static/internal/basis/index.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">🗄 基础数据库</a>
+    <a href="/static/internal/qc.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">🔍 质检</a>
     <a href="/static/internal/outsource-requests.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">📨 询价单</a>
     <a href="/static/internal/outsource-orders.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">🛠 加工单</a>
+    <a href="/static/internal/material-pos.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">📦 采购单</a>
     <a href="/static/internal/approvals.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">📋 我的待办</a>
     <span class="badge">internal</span>
     <span id="user-name">—</span>
@@ -22,9 +25,14 @@
 </header>
 
 <main>
+  <div class="page-header">
+    <h1>🏢 <span id="hello">欢迎回来</span></h1>
+    <div class="muted">我方视角 · 项目立项 → 生产决策 → 委外采购 → 质检交付</div>
+  </div>
+
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
-      <h2 style="margin:0;">📋 项目列表</h2>
+      <h2 style="margin:0; border:none; padding:0;">📋 项目列表</h2>
       <button class="primary" onclick="openCreateModal()">+ 新建项目</button>
     </div>
 
@@ -88,6 +96,8 @@
 (function () {
   const user = App.requireTenantType('internal');
   document.getElementById('user-name').textContent = user.display_name || user.username;
+  const helloEl = document.getElementById('hello');
+  if (helloEl) helloEl.textContent = `你好，${user.display_name || user.username}`;
 
   function showToast(msg, type='success') {
     const t = document.getElementById('toast');

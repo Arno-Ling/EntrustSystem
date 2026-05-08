@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>全流程看板 - MVP</title>
+<link rel="stylesheet" href="/static/common.css">
+<style>
+.kanban-row { display:grid; grid-template-columns:260px repeat(10, 1fr); gap:4px; padding:12px 16px; border-bottom:1px solid #2d3e58; align-items:center; transition: background .1s ease; }
+.kanban-row:hover { background:#172038; }
+.kanban-head { font-size:11px; color:#94a3b8; text-transform:uppercase; letter-spacing:.3px; background:#15203a; font-weight:600; }
+.project-cell { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.project-cell code { color:#60a5fa; }
+.project-cell .muted { font-size:10px; }
+.node { text-align:center; padding:8px 4px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer; position:relative; transition: all .15s ease; }
+.node:hover { transform: scale(1.08); box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+.node.pending     { background:#1e293b; color:#64748b; border:1px solid #2d3e58; }
+.node.in_progress { background:linear-gradient(135deg,#78350f,#92400e); color:#fcd34d; border:1px solid #d97706; animation:pulse 2s infinite; }
+.node.done        { background:linear-gradient(135deg,#064e3b,#047857); color:#6ee7b7; border:1px solid #10b981; }
+.node.skipped     { background:#334155; color:#94a3b8; text-decoration:line-through; border:1px solid #475569; }
+.node.blocked     { background:linear-gradient(135deg,#7f1d1d,#991b1b); color:#fca5a5; border:1px solid #dc2626; }
+.node.on_hold     { background:linear-gradient(135deg,#581c87,#6b21a8); color:#d8b4fe; border:1px solid #a855f7; }
+.node:hover::after {
+  content: attr(data-tooltip); position:absolute; bottom:calc(100% + 6px); left:50%; transform:translateX(-50%);
+  background:#0f172a; color:#e2e8f0; padding:8px 12px; border-radius:6px; font-size:11px;
+  white-space:nowrap; border:1px solid #3b5278; z-index:10; box-shadow: 0 4px 12px rgba(0,0,0,.4);
+  font-weight:normal; letter-spacing:normal;
+}
+@keyframes pulse { 0%{opacity:.75}50%{opacity:1}100%{opacity:.75} }
+.progress-bar {
+  height:4px; background:#2d3e58; border-radius:2px; margin-top:4px; overflow:hidden;
+}
+.progress-bar > div {
+  height:100%; background:linear-gradient(90deg, #60a5fa, #34d399);
+  transition: width .3s ease;
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><a href="/static/internal/home.html" style="color:inherit;">🏢 模具委外采购系统</a> &nbsp;›&nbsp; <span style="color:#e2e8f0;">全流程看板</span></div>
+  <div class="user">
+    <span class="badge">internal</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="card" style="padding:14px;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <div style="font-size:12px; color:#94a3b8;">
+        10 节点：
+        <span class="node done" style="padding:2px 6px;">done</span>
+        <span class="node in_progress" style="padding:2px 6px;">in_progress</span>
+        <span class="node pending" style="padding:2px 6px;">pending</span>
+        <span class="node on_hold" style="padding:2px 6px;">on_hold</span>
+      </div>
+      <button class="secondary" onclick="loadKanban()">↻ 刷新</button>
+    </div>
+  </div>
+
+  <div class="card" style="padding:0;">
+    <div class="kanban-row kanban-head">
+      <div>项目</div>
+      <div>草稿</div>
+      <div>确认</div>
+      <div>决策中</div>
+      <div>决策完</div>
+      <div>采购</div>
+      <div>生产</div>
+      <div>外协</div>
+      <div>质检</div>
+      <div>异常</div>
+      <div>交付</div>
+    </div>
+    <div id="kanbanBody"><div class="empty" style="padding:30px;">加载中...</div></div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('internal');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+
+  function toast(msg, err=false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast show ' + (err?'error':'success');
+    setTimeout(() => t.className = 'toast', 2500);
+  }
+
+  async function syncAll(projectIds) {
+    for (const pid of projectIds) {
+      try { await App.api(`/api/internal/tracking/${pid}/sync`, { method:'POST' }); } catch(e){}
+    }
+  }
+
+  window.loadKanban = async () => {
+    // 第一次：先拉项目列表 → 逐个同步
+    const pl = await App.api('/api/internal/projects?page_size=30');
+    const pids = pl.items.map(p => p.id);
+    await syncAll(pids);
+
+    const r = await App.api('/api/internal/tracking');
+    const body = document.getElementById('kanbanBody');
+    if (!r.projects.length) {
+      body.innerHTML = `<div class="empty" style="padding:30px;">暂无项目</div>`; return;
+    }
+    body.innerHTML = r.projects.map(p => {
+      const doneCount = p.nodes.filter(n => n.status === 'done').length;
+      const pct = Math.round(doneCount / p.nodes.length * 100);
+      const cells = p.nodes.map(n => {
+        const tt = [
+          `${n.name} · ${n.status}`,
+          n.started_at ? `start: ${new Date(n.started_at).toLocaleString('zh-CN')}` : null,
+          n.ended_at   ? `end:   ${new Date(n.ended_at).toLocaleString('zh-CN')}` : null,
+          n.duration_hours != null ? `dur: ${n.duration_hours.toFixed(1)}h` : null,
+          n.blocker_reason ? `blocked: ${n.blocker_reason}` : null,
+        ].filter(Boolean).join(' · ');
+        return `<div class="node ${n.status}" data-tooltip="${App.esc(tt)}"
+                      onclick="holdNode(${p.project_id}, '${App.esc(n.code)}', '${App.esc(n.name)}', '${n.status}')">
+                  ${n.status === 'done' ? '✓' : (n.status === 'in_progress' ? '●' : (n.status === 'on_hold' ? '⏸' : (n.status === 'blocked' ? '✕' : '·')))}
+                </div>`;
+      }).join('');
+      return `
+        <div class="kanban-row" onclick="void(0)">
+          <div class="project-cell">
+            <div><code>${App.esc(p.project_no)}</code> <span class="muted" style="font-size:10px;">${pct}%</span></div>
+            <div class="muted">${App.esc(p.project_name || '—')} · ${App.esc(p.customer || '')}</div>
+            <div class="progress-bar"><div style="width:${pct}%"></div></div>
+          </div>
+          ${cells}
+        </div>`;
+    }).join('');
+  };
+
+  window.holdNode = async (project_id, node_code, node_name, cur_status) => {
+    const reason = prompt(`给节点【${node_name}】添加备注/挂起原因（留空取消）：`);
+    if (!reason) return;
+    try {
+      await App.api(`/api/internal/tracking/${project_id}/hold`,
+        { method:'POST', body: { node_code, reason } });
+      toast('✓ 已挂起');
+      loadKanban();
+    } catch (e) { toast('❌ ' + e.message, true); }
+  };
+
+  loadKanban();
+})();
+</script>
+</body>
+</html>

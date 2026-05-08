@@ -65,6 +65,20 @@
     </div>
   </div>
 
+  <!-- 模具套 -->
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+      <h2 style="margin:0;">🧱 模具套</h2>
+      <button class="primary" id="btnAddMold" onclick="openMoldModal()" style="display:none;">+ 新建模具</button>
+    </div>
+    <table>
+      <thead>
+        <tr><th>模具号</th><th>名称</th><th>零件数</th><th>状态</th><th style="width:80px;">操作</th></tr>
+      </thead>
+      <tbody id="moldsBody"><tr><td colspan="5" class="empty">—</td></tr></tbody>
+    </table>
+  </div>
+
   <!-- 零件清单 -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
@@ -75,15 +89,16 @@
       <thead>
         <tr>
           <th>零件号</th>
+          <th>所属模具</th>
+          <th>类型</th>
           <th>名称</th>
           <th>材质</th>
           <th>数量</th>
-          <th>工序（新）</th>
-          <th>规格</th>
+          <th>工序</th>
           <th style="width:140px;">操作</th>
         </tr>
       </thead>
-      <tbody id="partsBody"><tr><td colspan="7" class="empty">加载中...</td></tr></tbody>
+      <tbody id="partsBody"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
     </table>
   </div>
 
@@ -118,8 +133,24 @@
     <form id="frmPart" onsubmit="return doAddPart(event)">
       <div class="flex">
         <div class="flex-grow">
-          <label>零件号 <span class="muted">(规范：die-02/part-01/ins-03)</span> *</label>
-          <input name="part_no" required placeholder="die-02">
+          <label>所属模具</label>
+          <select name="mold_id" id="moldSel"><option value="">（不归属模具）</option></select>
+        </div>
+        <div class="flex-grow">
+          <label>类型 *</label>
+          <select name="part_type" required>
+            <option value="die">die 模芯</option>
+            <option value="ins">ins 镶件</option>
+            <option value="part">part 普通件</option>
+            <option value="frame">frame 模架</option>
+            <option value="std">std 标准件</option>
+          </select>
+        </div>
+      </div>
+      <div class="flex">
+        <div class="flex-grow">
+          <label>零件号 <span class="muted">(留空则自动生成 die-02)</span></label>
+          <input name="part_no" placeholder="留空自动">
         </div>
         <div class="flex-grow">
           <label>数量</label>
@@ -137,6 +168,24 @@
       <div class="modal-actions">
         <button type="button" class="secondary" onclick="closePartModal()">取消</button>
         <button type="submit" class="primary">添加</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Modal: 新建模具 -->
+<div class="modal-bg" id="moldModal">
+  <div class="modal">
+    <h3>+ 新建模具套</h3>
+    <form onsubmit="return doAddMold(event)">
+      <label>模具名称</label>
+      <input name="name" placeholder="例：主分型模 A">
+      <label>备注</label>
+      <input name="remark">
+      <p class="muted" style="margin-top:8px;">模具号自动生成为 &lt;项目号&gt;-M01 / -M02 ...</p>
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeMoldModal()">取消</button>
+        <button type="submit" class="primary">新建</button>
       </div>
     </form>
   </div>
@@ -230,6 +279,7 @@
       // Action buttons based on status
       document.getElementById('btnConfirm').style.display = p.status === 'drafted' ? 'inline-block' : 'none';
       document.getElementById('btnAddPart').style.display = p.status === 'drafted' ? 'inline-block' : 'none';
+      document.getElementById('btnAddMold').style.display = p.status === 'drafted' ? 'inline-block' : 'none';
       document.getElementById('btnUpload').style.display   = p.status === 'drafted' ? 'inline-block' : 'none';
       document.getElementById('btnDecide').style.display   = p.status === 'confirmed' ? 'inline-block' : 'none';
 
@@ -240,10 +290,34 @@
         viewDec.href = `/static/internal/decisions.html?project_id=${pid}`;
       }
 
+      // Molds
+      const molds = data.molds || [];
+      const moldMap = {};
+      molds.forEach(m => moldMap[m.id] = m.mold_no);
+      const moldsBody = document.getElementById('moldsBody');
+      if (!molds.length) {
+        moldsBody.innerHTML = `<tr><td colspan="5" class="empty">${p.status === 'drafted' ? '点【+ 新建模具】组织零件' : '此项目没有模具套'}</td></tr>`;
+      } else {
+        moldsBody.innerHTML = molds.map(m => `
+          <tr>
+            <td><code>${App.esc(m.mold_no)}</code></td>
+            <td>${App.esc(m.name || '—')}</td>
+            <td>${m.part_count} 件</td>
+            <td><span class="badge ${m.status}">${m.status}</span></td>
+            <td>${p.status === 'drafted' && m.part_count === 0
+                ? `<button class="danger" onclick="delMold(${m.id})">删</button>`
+                : '—'}</td>
+          </tr>`).join('');
+      }
+      // 同步模具下拉选项
+      const moldSel = document.getElementById('moldSel');
+      moldSel.innerHTML = '<option value="">（不归属模具）</option>' +
+        molds.map(m => `<option value="${m.id}">${App.esc(m.mold_no)}${m.name ? ' · ' + App.esc(m.name) : ''}</option>`).join('');
+
       // Parts
       const partsBody = document.getElementById('partsBody');
       if (!data.parts.length) {
-        partsBody.innerHTML = `<tr><td colspan="7" class="empty">还没有零件，点【+ 添加零件】</td></tr>`;
+        partsBody.innerHTML = `<tr><td colspan="8" class="empty">还没有零件，点【+ 添加零件】</td></tr>`;
       } else {
         partsBody.innerHTML = data.parts.map(pt => {
           const plist = pt.process_list || [];
@@ -253,24 +327,24 @@
                   ? ' style="background:#fca5a5; color:#7f1d1d;"' : '';
                 return `<span class="badge drafted" ${forced} title="${App.esc(pr.method_name)}${pr.faces?' / 面:'+App.esc(pr.faces):''}">${App.esc(pr.process_code)}</span>`;
               }).join(' ')
-            : (pt.processes.length
-                ? pt.processes.map(s => '<span class="badge drafted" style="margin-right:4px;">'+App.esc(s)+'</span>').join('')
-                : '<span class="muted">未录入</span>');
+            : '<span class="muted">未录入</span>';
           const actions = [];
           if (p.status === 'drafted') {
-            actions.push(`<button class="secondary" onclick="openProcModal(${pt.id}, '${App.esc(pt.part_no)}')">管理工序</button>`);
-            actions.push(`<button class="danger" onclick="delPart(${pt.id})">删除</button>`);
+            actions.push(`<button class="secondary" onclick="openProcModal(${pt.id}, '${App.esc(pt.part_no)}')">工序</button>`);
+            actions.push(`<button class="danger" onclick="delPart(${pt.id})">删</button>`);
           } else {
-            actions.push(`<button class="secondary" onclick="openProcModal(${pt.id}, '${App.esc(pt.part_no)}')">查看工序</button>`);
+            actions.push(`<button class="secondary" onclick="openProcModal(${pt.id}, '${App.esc(pt.part_no)}')">查看</button>`);
           }
+          const moldLabel = pt.mold_id ? (moldMap[pt.mold_id] || `#${pt.mold_id}`) : '—';
           return `
             <tr>
               <td><code>${App.esc(pt.part_no)}</code></td>
+              <td><code style="color:#fcd34d;">${App.esc(moldLabel)}</code></td>
+              <td><span class="badge">${App.esc(pt.part_type || '—')}</span></td>
               <td>${App.esc(pt.part_name || '—')}</td>
               <td>${App.esc(pt.material || '—')}</td>
               <td>${pt.qty}</td>
               <td>${procHtml}</td>
-              <td>${App.esc(pt.spec || '—')}</td>
               <td>${actions.join(' ')}</td>
             </tr>
           `;
@@ -305,7 +379,9 @@
     const fd = new FormData(ev.target);
     const proc = (fd.get('processes') || '').split(',').map(s => s.trim()).filter(Boolean);
     const body = {
-      part_no: fd.get('part_no'),
+      part_no: fd.get('part_no') || null,
+      part_type: fd.get('part_type'),
+      mold_id: fd.get('mold_id') ? parseInt(fd.get('mold_id')) : null,
       part_name: fd.get('part_name') || null,
       material: fd.get('material') || null,
       qty: parseInt(fd.get('qty')) || 1,
@@ -313,8 +389,8 @@
       spec: fd.get('spec') || null,
     };
     try {
-      await App.api(`/api/internal/projects/${pid}/parts`, { method:'POST', body });
-      showToast('✓ 零件已添加');
+      const r = await App.api(`/api/internal/projects/${pid}/parts`, { method:'POST', body });
+      showToast(`✓ 零件已添加：${r.part_no}`);
       ev.target.reset();
       closePartModal();
       load();
@@ -322,6 +398,33 @@
       showToast('❌ ' + e.message, 'error');
     }
     return false;
+  };
+
+  window.openMoldModal = () => document.getElementById('moldModal').classList.add('show');
+  window.closeMoldModal = () => document.getElementById('moldModal').classList.remove('show');
+  window.doAddMold = async (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const body = {
+      name: fd.get('name') || null,
+      remark: fd.get('remark') || null,
+    };
+    try {
+      const r = await App.api(`/api/internal/projects/${pid}/molds`, { method:'POST', body });
+      showToast(`✓ 模具已建：${r.mold_no}`);
+      ev.target.reset();
+      closeMoldModal();
+      load();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
+    return false;
+  };
+  window.delMold = async (mold_id) => {
+    if (!confirm('删除这个模具？（只允许无零件的模具）')) return;
+    try {
+      await App.api(`/api/internal/molds/${mold_id}`, { method:'DELETE' });
+      showToast('✓ 已删除');
+      load();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
   };
 
   window.delPart = async (part_id) => {

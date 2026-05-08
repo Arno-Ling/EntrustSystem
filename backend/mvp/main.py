@@ -26,7 +26,19 @@ from mvp.auth import router as auth_router
 from mvp.routes.basis import router as basis_router
 from mvp.routes.common import router as common_router
 from mvp.routes.internal import router as internal_router
+from mvp.routes.material import router as material_router
 from mvp.routes.processor import router as processor_router
+from mvp.routes.qc import router as qc_router, get_counterparty_router as _qc_counterparty
+from mvp.routes.recon import (
+    internal_router  as recon_internal_router,
+    material_router  as recon_material_router,
+    processor_router as recon_processor_router,
+)
+from mvp.routes.inquiry import (
+    internal_router  as inquiry_internal_router,
+    material_router  as inquiry_material_router,
+    processor_router as inquiry_processor_router,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +50,8 @@ logger = logging.getLogger("mvp")
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 STATIC_DIR = BACKEND_DIR / "static"
 STATIC_DIR.mkdir(exist_ok=True)
+UPLOADS_DIR = BACKEND_DIR / "uploads"
+UPLOADS_DIR.mkdir(exist_ok=True)
 
 app = FastAPI(
     title="模具委外采购系统 - 轻量 MVP",
@@ -56,12 +70,22 @@ app.add_middleware(
 
 # Static files
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
 # Routes
 app.include_router(auth_router)
 app.include_router(internal_router)
 app.include_router(basis_router)
 app.include_router(processor_router)
+app.include_router(material_router)
+app.include_router(qc_router)
+app.include_router(_qc_counterparty())
+app.include_router(recon_internal_router)
+app.include_router(recon_material_router)
+app.include_router(recon_processor_router)
+app.include_router(inquiry_internal_router)
+app.include_router(inquiry_material_router)
+app.include_router(inquiry_processor_router)
 app.include_router(common_router)
 
 

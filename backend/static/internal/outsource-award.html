@@ -8,12 +8,23 @@
 <style>
   tr.winner-row { background:#065f46 !important; }
   tr.winner-row td { border-color: #10b981; }
-  .winner-flag { color:#fbbf24; font-size:16px; }
-  input[type="radio"] { width:18px; height:18px; cursor:pointer; }
+  input[type=radio] { width:18px; height:18px; cursor:pointer; }
   .price-lowest { color:#10b981; font-weight:600; }
   .price-deviation { font-size:11px; margin-left:6px; }
-  .dev-up { color:#ef4444; }
-  .dev-down { color:#10b981; }
+  .dev-up { color:#ef4444; } .dev-down { color:#10b981; }
+  /* 矩阵模式 */
+  .matrix { width:100%; border-collapse:collapse; font-size:12px; }
+  .matrix th, .matrix td { padding:8px; border:1px solid #334155; }
+  .matrix th.sticky-left { position:sticky; left:0; background:#1e293b; z-index:2; }
+  .matrix td.sticky-left { position:sticky; left:0; background:#1e293b; }
+  .matrix td.no-quote { color:#64748b; font-style:italic; }
+  .matrix label.quote-cell {
+    display:block; cursor:pointer; padding:6px; border-radius:4px;
+    border:2px solid transparent;
+  }
+  .matrix label.quote-cell:hover { background:#0f172a; }
+  .matrix input[type=radio]:checked + .cell-inner { background:#065f46; border-color:#10b981; }
+  .cell-inner { padding:4px 8px; border:2px solid #334155; border-radius:4px; }
 </style>
 </head>
 <body>
@@ -36,29 +47,37 @@
     <div id="basic" style="margin-top:14px;">加载中...</div>
   </div>
 
-  <div class="card">
+  <!-- 矩阵模式（有 scope_items 时显示） -->
+  <div class="card" id="matrixCard" style="display:none;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+      <h2 style="margin:0;">🧩 5 层粒度逐项报价矩阵</h2>
+      <div class="muted" style="font-size:12px;">每行一个委外项，每列一家加工方 · 给每行选一家中标（可以不同家）</div>
+    </div>
+    <div style="overflow-x:auto;">
+      <table class="matrix" id="matrix">
+        <thead id="matrixHead"></thead>
+        <tbody id="matrixBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 传统整单模式（无 scope_items 时显示，老兼容） -->
+  <div class="card" id="legacyCard" style="display:none;">
     <div style="display:flex; justify-content:space-between; align-items:center;">
-      <h2 style="margin:0;">💰 报价对比</h2>
-      <div class="muted" style="font-size:12px;">选中一行作为中标供应商，然后点底部【✅ 批准中标】</div>
+      <h2 style="margin:0;">💰 报价对比 — 整单模式</h2>
+      <div class="muted" style="font-size:12px;">没有 5 层委外项：选一家作整单中标</div>
     </div>
     <table style="margin-top:14px;">
-      <thead>
-        <tr>
-          <th style="width:48px;">选</th>
-          <th>供应商</th>
-          <th>主营</th>
-          <th>单价（元）</th>
-          <th>交期（天）</th>
-          <th>数量</th>
-          <th>总金额</th>
-          <th>备注</th>
-          <th>提交时间</th>
-        </tr>
-      </thead>
-      <tbody id="tbody"><tr><td colspan="9" class="empty">加载中...</td></tr></tbody>
+      <thead><tr>
+        <th style="width:48px;">选</th>
+        <th>供应商</th><th>主营</th><th>单价</th><th>交期</th><th>数量</th>
+        <th>总金额</th><th>备注</th><th>提交时间</th>
+      </tr></thead>
+      <tbody id="legacyBody"></tbody>
     </table>
   </div>
 
+  <!-- 审批动作 -->
   <div class="card" id="actionCard" style="display:none;">
     <h2>✍️ 审批意见</h2>
     <textarea id="comment" rows="3" placeholder="审批意见（可选）"></textarea>
@@ -78,10 +97,13 @@
   document.getElementById('user-name').textContent = user.display_name || user.username;
 
   const taskId = new URLSearchParams(location.search).get('task_id');
-  if (!taskId) { alert('缺少 task_id'); location.href = '/static/internal/approvals.html'; return; }
+  if (!taskId) { alert('缺少 task_id'); location.href='/static/internal/approvals.html'; return; }
 
+  let mode = 'legacy';     // 'matrix' or 'legacy'
   let selectedInv = null;
+  let selectedLines = {};  // scope_item_id -> line_id
   let quantity = 1;
+  let scopeItems = [];
 
   function toast(msg, type='success') {
     const t = document.getElementById('toast');
@@ -94,94 +116,175 @@
       const data = await App.api('/api/internal/approvals/' + taskId);
       const t = data.task;
       if (t.kind !== 'outsource_award') {
-        alert('不是委外审批任务，返回');
-        location.href = '/static/internal/approvals.html';
+        alert('不是委外审批任务');
+        location.href='/static/internal/approvals.html';
         return;
       }
-
       const req = data.payload.request;
       quantity = req.quantity || 1;
       document.getElementById('basic').innerHTML = `
         <div><b>项目</b>: <code>${App.esc(req.project_no)}</code> ${App.esc(req.project_name || '')}</div>
         <div><b>标题</b>: ${App.esc(req.title)}</div>
         <div><b>数量</b>: ${req.quantity || '—'} &nbsp;|&nbsp; <b>交期</b>: ${App.esc(req.deadline || '—')}</div>
-        <div style="margin-top:6px;"><b>所需工艺</b>:
-          ${(req.required_processes || []).map(p => '<span class="badge drafted" style="margin-right:4px;">'+App.esc(p)+'</span>').join('')}
-        </div>
       `;
 
+      scopeItems = data.payload.scope_items || [];
+      const qLines = data.payload.quotation_lines || [];
       const quotes = data.payload.quotations || [];
-      const tbody = document.getElementById('tbody');
-      if (!quotes.length) {
-        tbody.innerHTML = `<tr><td colspan="9" class="empty">没有任何报价</td></tr>`;
-        document.getElementById('actionCard').style.display = t.status === 'pending' ? 'block' : 'none';
-        return;
+
+      if (scopeItems.length > 0 && qLines.length > 0) {
+        mode = 'matrix';
+        renderMatrix(scopeItems, qLines);
+      } else {
+        mode = 'legacy';
+        renderLegacy(quotes);
       }
-
-      // lowest price for deviation calc
-      const lowest = Math.min(...quotes.map(q => q.unit_price));
-
-      tbody.innerHTML = quotes.map((q, idx) => {
-        const total = (q.unit_price * quantity).toFixed(2);
-        const isLowest = q.unit_price === lowest;
-        const dev = lowest === 0 ? 0 : ((q.unit_price - lowest) / lowest * 100);
-        let devBadge = '';
-        if (dev > 0) devBadge = `<span class="price-deviation dev-up">+${dev.toFixed(1)}%</span>`;
-        else if (isLowest) devBadge = `<span class="price-deviation dev-down">最低</span>`;
-
-        return `
-          <tr id="row-${q.invitation_id}">
-            <td><input type="radio" name="winner" value="${q.invitation_id}"
-                       onchange="pick(${q.invitation_id})"
-                       ${t.status !== 'pending' ? 'disabled' : ''}></td>
-            <td><b>${App.esc(q.supplier_name)}</b></td>
-            <td class="muted">${App.esc(q.supplier_category || '—')}</td>
-            <td class="${isLowest ? 'price-lowest' : ''}">¥${q.unit_price} ${devBadge}</td>
-            <td>${q.lead_time_days}</td>
-            <td>${quantity}</td>
-            <td><b>¥${total}</b></td>
-            <td class="muted" style="max-width:200px;">${App.esc(q.note || '')}</td>
-            <td class="muted">${q.submitted_at ? App.fmtDate(q.submitted_at) : '—'}</td>
-          </tr>
-        `;
-      }).join('');
 
       document.getElementById('actionCard').style.display = t.status === 'pending' ? 'block' : 'none';
-      if (t.status !== 'pending') {
-        toast('ℹ️ 任务已处理（' + t.status + '）', 'success');
-      }
+      if (t.status !== 'pending') toast('ℹ️ 任务已处理（' + t.status + '）');
     } catch (e) {
       toast('❌ ' + e.message, 'error');
     }
   }
 
-  window.pick = (invId) => {
-    document.querySelectorAll('tr.winner-row').forEach(tr => tr.classList.remove('winner-row'));
-    document.getElementById('row-' + invId).classList.add('winner-row');
-    selectedInv = invId;
+  // ---------- 矩阵模式 ----------
+  function renderMatrix(items, lines) {
+    document.getElementById('matrixCard').style.display = 'block';
+
+    // 按 quotation_id 聚合不同供应商
+    const supplierMap = {};   // quotation_id -> { name, lines: [line_id -> {unit_price,...}] }
+    lines.forEach(l => {
+      const key = l.quotation_id;
+      if (!supplierMap[key]) supplierMap[key] = { name: l.supplier_name, invitation_id: l.invitation_id, byItem: {} };
+      supplierMap[key].byItem[l.scope_item_id] = l;
+    });
+    const suppliers = Object.entries(supplierMap);
+
+    // thead
+    const head = document.getElementById('matrixHead');
+    head.innerHTML = `
+      <tr>
+        <th class="sticky-left" style="min-width:200px;">委外项</th>
+        <th style="min-width:120px;">粒度/数量</th>
+        ${suppliers.map(([qid, s]) => `<th style="min-width:140px;">${App.esc(s.name)}</th>`).join('')}
+      </tr>`;
+
+    // tbody
+    const body = document.getElementById('matrixBody');
+    body.innerHTML = items.map(it => {
+      // 找到这个 item 的最低价
+      const prices = suppliers
+        .map(([qid, s]) => s.byItem[it.scope_item_id]?.unit_price)
+        .filter(p => p != null);
+      const lowest = prices.length ? Math.min(...prices) : null;
+
+      const cells = suppliers.map(([qid, s]) => {
+        const line = s.byItem[it.scope_item_id];
+        if (!line) {
+          return '<td class="no-quote">—</td>';
+        }
+        const isLow = line.unit_price === lowest ? ' price-lowest' : '';
+        return `
+          <td>
+            <label class="quote-cell">
+              <input type="radio" name="pick_${it.scope_item_id}" value="${line.line_id}"
+                     onchange="pickLine(${it.scope_item_id}, ${line.line_id})"
+                     style="display:none;">
+              <div class="cell-inner">
+                <div class="${isLow}">¥${line.unit_price}</div>
+                <div class="muted" style="font-size:10px;">${line.lead_time_days}天</div>
+              </div>
+            </label>
+          </td>`;
+      }).join('');
+
+      return `
+        <tr>
+          <td class="sticky-left">
+            <div><b>${App.esc(it.scope_level)}</b></div>
+            <div style="font-size:11px;" class="muted">${App.esc(it.display_path)}</div>
+          </td>
+          <td class="muted" style="text-align:center;">${it.quantity}</td>
+          ${cells}
+        </tr>`;
+    }).join('');
+  }
+
+  window.pickLine = (scope_item_id, line_id) => {
+    selectedLines[scope_item_id] = line_id;
+    const anyPicked = Object.keys(selectedLines).length > 0;
+    document.getElementById('btnApprove').disabled = !anyPicked;
+    // 视觉反馈：移除同行其他选中背景
+    const row = document.querySelector(`input[name="pick_${scope_item_id}"]`).closest('tr');
+    row.querySelectorAll('label.quote-cell').forEach(l => l.style.background = '');
+    const chosen = document.querySelector(`input[name="pick_${scope_item_id}"][value="${line_id}"]`);
+    chosen.closest('label').style.background = '#065f46';
+  };
+
+  // ---------- 整单模式 ----------
+  function renderLegacy(quotes) {
+    document.getElementById('legacyCard').style.display = 'block';
+    const tbody = document.getElementById('legacyBody');
+    if (!quotes.length) {
+      tbody.innerHTML = `<tr><td colspan="9" class="empty">没有任何报价</td></tr>`;
+      return;
+    }
+    const lowest = Math.min(...quotes.map(q => q.unit_price));
+    tbody.innerHTML = quotes.map(q => {
+      const total = (q.unit_price * quantity).toFixed(2);
+      const isLow = q.unit_price === lowest;
+      return `<tr id="row-${q.invitation_id}">
+        <td><input type="radio" name="winner" onchange="pickInv(${q.invitation_id})"></td>
+        <td><b>${App.esc(q.supplier_name)}</b></td>
+        <td class="muted">${App.esc(q.supplier_category || '—')}</td>
+        <td class="${isLow ? 'price-lowest' : ''}">¥${q.unit_price}</td>
+        <td>${q.lead_time_days}</td>
+        <td>${quantity}</td>
+        <td><b>¥${total}</b></td>
+        <td class="muted">${App.esc(q.note || '')}</td>
+        <td class="muted">${q.submitted_at ? App.fmtDate(q.submitted_at) : '—'}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  window.pickInv = (id) => {
+    document.querySelectorAll('tr.winner-row').forEach(r => r.classList.remove('winner-row'));
+    document.getElementById('row-' + id).classList.add('winner-row');
+    selectedInv = id;
     document.getElementById('btnApprove').disabled = false;
   };
 
   window.doAct = async (action) => {
-    if (action === 'approve' && !selectedInv) {
-      toast('❌ 请先选择中标供应商', 'error');
-      return;
+    if (action === 'approve') {
+      if (mode === 'matrix' && !Object.keys(selectedLines).length) {
+        toast('❌ 请至少给一行选择中标加工方', 'error');
+        return;
+      }
+      if (mode === 'legacy' && !selectedInv) {
+        toast('❌ 请先选择中标供应商', 'error');
+        return;
+      }
     }
-    const comment = document.getElementById('comment').value.trim();
-    const body = { action, comment: comment || null };
-    if (action === 'approve') body.awarded_invitation_id = selectedInv;
 
     if (action === 'reject' && !confirm('拒绝后询价单将取消，无法恢复。确定？')) return;
-    if (action === 'approve' && !confirm('批准后将生成正式委外加工单，推送给加工方。确定？')) return;
+    if (action === 'approve' && !confirm('批准后将生成委外加工单并推送给加工方。确定？')) return;
+
+    const comment = document.getElementById('comment').value.trim();
+    const body = { action, comment: comment || null };
+    if (action === 'approve') {
+      if (mode === 'matrix') {
+        body.awarded_lines = Object.values(selectedLines);
+      } else {
+        body.awarded_invitation_id = selectedInv;
+      }
+    }
 
     try {
-      const r = await App.api(`/api/internal/approvals/${taskId}/award`, {
-        method: 'POST', body,
-      });
+      const r = await App.api(`/api/internal/approvals/${taskId}/award`, { method:'POST', body });
       if (r.action === 'approve') {
-        toast(`✓ 中标已批准，加工单 ${r.order_no} 已生成`);
+        toast(`✓ 已批准，${r.outsource_order_ids.length} 张加工单生成（${r.mode}）`);
       } else {
-        toast(`✓ 已拒绝全部报价`);
+        toast(`✓ 已拒绝`);
       }
       setTimeout(() => location.href = '/static/internal/approvals.html', 1500);
     } catch (e) { toast('❌ ' + e.message, 'error'); }

@@ -22,6 +22,7 @@
 <header class="topbar">
   <div class="brand">🏭 模具委外采购系统 - 加工方视角</div>
   <div class="user">
+    <a href="/static/processor/my-exceptions.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">⚠️ 异常通知</a>
     <span class="badge processor">processor</span>
     <span id="user-name">—</span>
     <button class="logout" onclick="App.logout()">退出</button>
@@ -29,6 +30,11 @@
 </header>
 
 <main>
+  <div class="page-header">
+    <h1>🏭 <span id="hello">欢迎</span></h1>
+    <div class="muted">加工方视角 · 点开右上角【⚠️ 异常通知】查看被判责的异常</div>
+  </div>
+
   <div class="card">
     <div style="display:flex; gap:0;" class="tabs">
       <div class="tab active" data-tab="invitations">📨 询价邀请</div>
@@ -84,6 +90,8 @@
 (function () {
   const user = App.requireTenantType('processor');
   document.getElementById('user-name').textContent = user.display_name || user.username;
+  const helloEl = document.getElementById('hello');
+  if (helloEl) helloEl.textContent = `你好，${user.display_name || user.username}`;
 
   // Tab switching
   document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {

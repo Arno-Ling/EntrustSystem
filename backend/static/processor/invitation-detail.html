@@ -43,7 +43,33 @@
 
   <div class="card" id="quoteCard">
     <h2 id="quoteTitle">✍️ 提交报价</h2>
-    <div style="margin-top:14px;">
+
+    <!-- 矩阵报价（有 scope_items 时） -->
+    <div id="lineMode" style="display:none; margin-top:14px;">
+      <p class="muted">本询价单已细分为 <b id="lineCount">0</b> 个委外项，请按每一项填单价和交期。</p>
+      <table style="margin-top:8px;">
+        <thead><tr>
+          <th style="width:40px;">#</th>
+          <th>粒度</th>
+          <th>路径</th>
+          <th>数量</th>
+          <th style="width:120px;">单价（元）</th>
+          <th style="width:80px;">交期（天）</th>
+          <th>备注</th>
+        </tr></thead>
+        <tbody id="lineBody"></tbody>
+      </table>
+      <div style="margin-top:14px;">
+        <label>整体备注</label>
+        <textarea id="note_lines" rows="2"></textarea>
+      </div>
+      <div style="margin-top:12px; display:flex; justify-content:flex-end;">
+        <button class="primary" id="btnSubmitLines" onclick="submitLines()">提交逐项报价</button>
+      </div>
+    </div>
+
+    <!-- 整单报价（legacy） -->
+    <div id="legacyMode" style="margin-top:14px;">
       <div class="flex">
         <div class="flex-grow">
           <label>单价（元/件）*</label>
@@ -130,19 +156,85 @@
       // Quote form
       const qc = document.getElementById('quoteCard');
       const btn = document.getElementById('btnSubmit');
-      if (inv.request_status !== 'inviting') {
-        document.getElementById('quoteTitle').textContent = '⏰ 报价已截止';
-        btn.disabled = true;
-        btn.textContent = '已截止';
-      } else if (data.my_quote) {
-        document.getElementById('quoteTitle').textContent = '✏️ 修改报价';
-        document.getElementById('unit_price').value = data.my_quote.unit_price;
-        document.getElementById('lead_time_days').value = data.my_quote.lead_time_days;
-        document.getElementById('note').value = data.my_quote.note || '';
-        btn.textContent = '更新报价';
+      const scope = data.scope_items || [];
+      const myLines = data.my_quote_lines || [];
+
+      if (scope.length > 0) {
+        // 矩阵模式
+        document.getElementById('lineMode').style.display = 'block';
+        document.getElementById('legacyMode').style.display = 'none';
+        document.getElementById('lineCount').textContent = scope.length;
+        const byItem = {};
+        myLines.forEach(l => byItem[l.scope_item_id] = l);
+
+        document.getElementById('lineBody').innerHTML = scope.map((it, idx) => {
+          const existing = byItem[it.scope_item_id];
+          return `<tr>
+            <td>${idx+1}</td>
+            <td><span class="badge ${it.scope_level === 'face' ? 'deciding' : 'drafted'}">${App.esc(it.scope_level)}</span></td>
+            <td style="font-size:11px;"><code>${App.esc(it.display_path)}</code>
+              ${it.description ? '<div class="muted">'+App.esc(it.description)+'</div>' : ''}</td>
+            <td>${it.quantity}</td>
+            <td><input type="number" step="0.01" min="0.01" data-sid="${it.scope_item_id}" class="line-price"
+                       value="${existing ? existing.unit_price : ''}"></td>
+            <td><input type="number" min="1" data-sid="${it.scope_item_id}" class="line-lead"
+                       value="${existing ? existing.lead_time_days : ''}"></td>
+            <td><input data-sid="${it.scope_item_id}" class="line-note"
+                       value="${existing ? App.esc(existing.note || '') : ''}"></td>
+          </tr>`;
+        }).join('');
+
+        if (data.my_quote) {
+          document.getElementById('quoteTitle').textContent = '✏️ 修改逐项报价';
+          document.getElementById('btnSubmitLines').textContent = '更新逐项报价';
+          document.getElementById('note_lines').value = data.my_quote.note || '';
+        }
+        if (inv.request_status !== 'inviting') {
+          document.getElementById('quoteTitle').textContent = '⏰ 报价已截止';
+          document.querySelectorAll('#lineMode input,#lineMode textarea,#lineMode button').forEach(e => e.disabled = true);
+        }
+      } else {
+        // 整单模式
+        if (inv.request_status !== 'inviting') {
+          document.getElementById('quoteTitle').textContent = '⏰ 报价已截止';
+          btn.disabled = true;
+          btn.textContent = '已截止';
+        } else if (data.my_quote) {
+          document.getElementById('quoteTitle').textContent = '✏️ 修改报价';
+          document.getElementById('unit_price').value = data.my_quote.unit_price;
+          document.getElementById('lead_time_days').value = data.my_quote.lead_time_days;
+          document.getElementById('note').value = data.my_quote.note || '';
+          btn.textContent = '更新报价';
+        }
       }
     } catch (e) { toast('❌ ' + e.message, 'error'); }
   }
+
+  window.submitLines = async () => {
+    const rows = document.querySelectorAll('#lineBody tr');
+    const lines = [];
+    for (const r of rows) {
+      const priceEl = r.querySelector('.line-price');
+      const leadEl  = r.querySelector('.line-lead');
+      const noteEl  = r.querySelector('.line-note');
+      const sid = parseInt(priceEl.dataset.sid);
+      const price = parseFloat(priceEl.value);
+      const lead = parseInt(leadEl.value);
+      if (!(price > 0) || !(lead > 0)) {
+        toast('❌ 每行都必须填单价和交期', 'error');
+        return;
+      }
+      lines.push({ scope_item_id: sid, unit_price: price, lead_time_days: lead, note: noteEl.value.trim() || null });
+    }
+    try {
+      const r = await App.api(`/api/processor/invitations/${id}/quote`, {
+        method: 'POST',
+        body: { lines, note: document.getElementById('note_lines').value.trim() || null },
+      });
+      toast(`✓ 逐项报价已提交，共 ${r.line_count} 行，汇总 ¥${r.total_price}`);
+      setTimeout(load, 500);
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  };
 
   window.submitQuote = async () => {
     const unit_price = parseFloat(document.getElementById('unit_price').value);

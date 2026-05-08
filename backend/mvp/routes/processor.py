@@ -14,7 +14,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from mvp import db
@@ -25,10 +25,22 @@ router = APIRouter(prefix="/api/processor", tags=["processor"])
 _require_processor = require_tenant_type("processor")
 
 
-class QuoteSubmit(BaseModel):
-    unit_price: float = Field(..., gt=0)
-    lead_time_days: int = Field(..., ge=1)
+class QuoteLine(BaseModel):
+    scope_item_id:   int
+    unit_price:      float = Field(..., gt=0)
+    lead_time_days:  int = Field(..., ge=1)
     note: Optional[str] = None
+
+
+class QuoteSubmit(BaseModel):
+    """报价提交。两种模式：
+      - 传统（兼容）：只填 unit_price/lead_time_days/note（整单一口价）
+      - 逐项：lines = [QuoteLine, ...]；unit_price 视作汇总价，后端自动聚合
+    """
+    unit_price: Optional[float] = None
+    lead_time_days: Optional[int] = None
+    note: Optional[str] = None
+    lines: Optional[list[QuoteLine]] = None
 
 
 class StatusTransition(BaseModel):
@@ -166,11 +178,37 @@ async def get_invitation(
         if my_quote.get("submitted_at"):
             my_quote["submitted_at"] = my_quote["submitted_at"].isoformat()
 
+    # 委外项清单（5 层粒度）
+    scope_items = db.fetch_all(
+        """
+        SELECT * FROM v_outsource_scope_display
+        WHERE request_id = %s
+        ORDER BY scope_item_id
+        """,
+        (inv["req_id"],),
+    )
+
+    # 我的报价明细（若已填过 lines）
+    my_quote_lines = []
+    if my_quote:
+        my_quote_lines = db.fetch_all(
+            """
+            SELECT ql.id, ql.scope_item_id, ql.unit_price, ql.lead_time_days, ql.note
+            FROM outsource_quotation_lines ql
+            WHERE ql.quotation_id = %s
+            """,
+            (my_quote["id"],),
+        )
+        for l in my_quote_lines:
+            l["unit_price"] = float(l["unit_price"])
+
     return {
         "invitation": inv,
         "parts": parts,
         "attachments": attachments,
         "my_quote": my_quote,
+        "scope_items": scope_items,
+        "my_quote_lines": my_quote_lines,
     }
 
 
@@ -200,10 +238,23 @@ async def submit_quote(
         raise HTTPException(status_code=409,
                             detail=f"邀请状态 '{inv['invitation_status']}' 不允许报价")
 
+    # 支持两种模式：传统整单一口价 / 逐项 lines
+    lines = payload.lines or []
+    if lines:
+        # 汇总：unit_price = sum(line_price), lead_time_days = max(line)
+        agg_price = sum(l.unit_price for l in lines)
+        agg_lead = max(l.lead_time_days for l in lines)
+    else:
+        if payload.unit_price is None or payload.lead_time_days is None:
+            raise HTTPException(status_code=400,
+                                detail="传统报价模式需要 unit_price + lead_time_days")
+        agg_price = payload.unit_price
+        agg_lead  = payload.lead_time_days
+
     now = datetime.utcnow()
     with db.get_conn() as conn:
         with conn.cursor() as cur:
-            # Upsert 报价 (1 invitation → 1 quote)
+            # Upsert 汇总报价 (1 invitation → 1 quote)
             cur.execute(
                 """
                 INSERT INTO outsource_quotations
@@ -215,10 +266,30 @@ async def submit_quote(
                     note = EXCLUDED.note,
                     submitted_by = EXCLUDED.submitted_by,
                     submitted_at = EXCLUDED.submitted_at
+                RETURNING id
                 """,
-                (inv_id, payload.unit_price, payload.lead_time_days,
+                (inv_id, agg_price, agg_lead,
                  payload.note, user.user_id, now),
             )
+            quotation_id = cur.fetchone()[0]
+
+            # 逐项 lines：清空旧行，写新行
+            if lines:
+                cur.execute(
+                    "DELETE FROM outsource_quotation_lines WHERE quotation_id = %s",
+                    (quotation_id,),
+                )
+                for l in lines:
+                    cur.execute(
+                        """
+                        INSERT INTO outsource_quotation_lines
+                            (quotation_id, scope_item_id, unit_price, lead_time_days, note)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (quotation_id, l.scope_item_id,
+                         l.unit_price, l.lead_time_days, l.note),
+                    )
+
             cur.execute(
                 """
                 UPDATE outsource_request_invitations
@@ -228,7 +299,14 @@ async def submit_quote(
                 (now, inv_id),
             )
 
-    return {"status": "quoted", "submitted_at": now.isoformat()}
+    return {
+        "status": "quoted",
+        "quotation_id": quotation_id,
+        "submitted_at": now.isoformat(),
+        "total_price": agg_price,
+        "lead_time_days": agg_lead,
+        "line_count": len(lines),
+    }
 
 
 # =============================================================================
@@ -331,7 +409,35 @@ async def get_order(
         if e.get("occurred_at"):
             e["occurred_at"] = e["occurred_at"].isoformat()
 
-    return {"order": row, "parts": parts, "events": events}
+    # 同一项目的材料方发货照（供加工方对比）
+    shipments_photos = []
+    ship_rows = db.fetch_all(
+        """
+        SELECT sh.shipment_no, sh.batch_no, sh.qty_shipped, sh.carrier,
+               sh.photo_paths, sh.shipped_at,
+               mpo.po_no, mpo.material_code, mpo.spec
+        FROM material_shipments sh
+        JOIN material_purchase_orders mpo ON sh.po_id = mpo.id
+        WHERE mpo.project_id = (SELECT project_id FROM outsource_requests WHERE id = %s)
+          AND sh.photo_paths IS NOT NULL
+        ORDER BY sh.shipped_at DESC
+        """,
+        (row["request_id"],),
+    )
+    for r in ship_rows:
+        if r.get("qty_shipped"): r["qty_shipped"] = float(r["qty_shipped"])
+        if r.get("shipped_at"):
+            r["shipped_at"] = r["shipped_at"].isoformat() if hasattr(r["shipped_at"], "isoformat") else r["shipped_at"]
+        # 展平成一个数组
+        shipments_photos.extend(r.get("photo_paths") or [])
+
+    return {
+        "order": row,
+        "parts": parts,
+        "events": events,
+        "shipments_photos": shipments_photos,
+        "shipments_detail": ship_rows,
+    }
 
 
 @router.post("/orders/{order_id}/status")
@@ -341,7 +447,11 @@ async def update_order_status(
     user: CurrentUser = Depends(_require_processor),
 ):
     row = db.fetch_one(
-        "SELECT id, status, tenant_id FROM outsource_orders WHERE id = %s",
+        """
+        SELECT id, status, tenant_id,
+               receive_photos, complete_photos
+        FROM outsource_orders WHERE id = %s
+        """,
         (order_id,),
     )
     if row is None:
@@ -356,6 +466,16 @@ async def update_order_status(
             status_code=409,
             detail=f"状态转换不合法: {current} → {payload.to_status}；允许: {sorted(allowed)}",
         )
+
+    # 拍照取证硬校验
+    if payload.to_status == "accepted":
+        if not (row["receive_photos"] and len(row["receive_photos"]) > 0):
+            raise HTTPException(status_code=400,
+                                detail="接单前必须上传至少 1 张【收料照片】")
+    if payload.to_status == "delivered":
+        if not (row["complete_photos"] and len(row["complete_photos"]) > 0):
+            raise HTTPException(status_code=400,
+                                detail="交货前必须上传至少 1 张【成品照片】")
 
     now = datetime.utcnow()
     with db.get_conn() as conn:
@@ -381,6 +501,111 @@ async def update_order_status(
             )
 
     return {"status": payload.to_status, "occurred_at": now.isoformat()}
+
+
+# =============================================================================
+# 拍照取证：加工方上传照片
+# =============================================================================
+
+import shutil as _shutil
+import uuid as _uuid
+
+
+@router.post("/orders/{order_id}/photos")
+async def upload_order_photo(
+    order_id: int,
+    stage: str = Form(...),                # receive / complete
+    note: str = Form(""),
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(_require_processor),
+):
+    """上传加工单照片。stage=receive（接单时收料）/ complete（完工交货）。
+
+    同一 stage 可多次调用，每次追加一张。
+    """
+    if stage not in ("receive", "complete"):
+        raise HTTPException(status_code=400, detail="stage 必须是 receive 或 complete")
+
+    row = db.fetch_one(
+        """
+        SELECT id, status, tenant_id,
+               receive_photos, complete_photos
+        FROM outsource_orders WHERE id = %s
+        """,
+        (order_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+    if row["tenant_id"] != _my_tenant_id(user):
+        raise HTTPException(status_code=403)
+
+    # 状态约束：receive 只能在 awarded 阶段上传；complete 必须在 producing
+    if stage == "receive" and row["status"] != "awarded":
+        raise HTTPException(status_code=409,
+                            detail=f"收料照只能在 'awarded' 状态上传，当前 {row['status']}")
+    if stage == "complete" and row["status"] != "producing":
+        raise HTTPException(status_code=409,
+                            detail=f"成品照只能在 'producing' 状态上传，当前 {row['status']}")
+
+    # 保存文件
+    target_dir = UPLOADS_DIR / "orders"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename or "").suffix
+    stored = f"o{order_id}_{stage}_{_uuid.uuid4().hex[:8]}{ext}"
+    target = target_dir / stored
+    with target.open("wb") as f:
+        _shutil.copyfileobj(file.file, f)
+    size = target.stat().st_size
+    rel = f"orders/{stored}"
+
+    # 追加到数组
+    col = f"{stage}_photos"
+    notes_col = f"{stage}_notes"
+    existing = row[col] or []
+    existing = [*existing, rel]
+
+    # 更新
+    db.execute(
+        f"UPDATE outsource_orders SET {col} = %s, {notes_col} = COALESCE(NULLIF(%s, ''), {notes_col}) WHERE id = %s",
+        (existing, note, order_id),
+    )
+
+    return {
+        "path": rel,
+        "url": f"/uploads/{rel}",
+        "file_name": file.filename,
+        "file_size": size,
+        "total_photos": len(existing),
+    }
+
+
+@router.delete("/orders/{order_id}/photos")
+async def delete_order_photo(
+    order_id: int,
+    stage: str,
+    path: str,
+    user: CurrentUser = Depends(_require_processor),
+):
+    """删除一张照片（前端误传时用）。"""
+    if stage not in ("receive", "complete"):
+        raise HTTPException(status_code=400)
+
+    row = db.fetch_one(
+        "SELECT tenant_id, receive_photos, complete_photos FROM outsource_orders WHERE id=%s",
+        (order_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+    if row["tenant_id"] != _my_tenant_id(user):
+        raise HTTPException(status_code=403)
+
+    col = f"{stage}_photos"
+    existing = row[col] or []
+    new_list = [p for p in existing if p != path]
+
+    db.execute(f"UPDATE outsource_orders SET {col} = %s WHERE id = %s",
+               (new_list, order_id))
+    return {"remaining": len(new_list)}
 
 
 # =============================================================================

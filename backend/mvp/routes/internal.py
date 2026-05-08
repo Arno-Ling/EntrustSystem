@@ -53,12 +53,21 @@ class ProjectUpdate(BaseModel):
 
 
 class PartCreate(BaseModel):
-    part_no: str = Field(..., min_length=1, max_length=64)
+    part_no: Optional[str] = None                   # 可省略，由后端根据 part_type + sort_no 生成 die-02 这种
     part_name: Optional[str] = None
     material: Optional[str] = None
     qty: int = Field(default=1, ge=1)
     processes: list[str] = Field(default_factory=list)
     spec: Optional[str] = None
+    mold_id: Optional[int] = None                   # 归属模具套
+    part_type: Optional[str] = None                 # die / ins / part / frame / std
+    sort_no: Optional[int] = None                   # 模具内排序
+
+
+class MoldCreate(BaseModel):
+    name: Optional[str] = None
+    remark: Optional[str] = None
+    sort_no: Optional[int] = None
 
 
 class ProcessCreate(BaseModel):
@@ -204,9 +213,11 @@ async def get_project(
 
     parts = db.fetch_all(
         """
-        SELECT id, part_no, part_name, material, qty, processes_json, spec,
+        SELECT id, mold_id, part_type, sort_no,
+               part_no, part_name, material, qty, processes_json, spec,
                created_at
-        FROM project_parts WHERE project_id = %s ORDER BY id ASC
+        FROM project_parts WHERE project_id = %s
+        ORDER BY COALESCE(mold_id, 0), sort_no NULLS LAST, id ASC
         """,
         (project_id,),
     )
@@ -245,8 +256,19 @@ async def get_project(
         (project_id,),
     )
 
+    molds = db.fetch_all(
+        """
+        SELECT m.id, m.mold_no, m.name, m.sort_no, m.status, m.remark, m.created_at,
+               (SELECT COUNT(*) FROM project_parts pp WHERE pp.mold_id = m.id) AS part_count
+        FROM molds m WHERE m.project_id = %s
+        ORDER BY m.sort_no ASC NULLS LAST, m.id ASC
+        """,
+        (project_id,),
+    )
+
     return {
         "project": project,
+        "molds": molds,
         "parts": parts,
         "attachments": attachments,
     }
@@ -301,18 +323,155 @@ async def add_part(
         raise HTTPException(status_code=409,
                             detail="Only 'drafted' projects can have parts added")
 
-    new_id = db.execute(
-        """
-        INSERT INTO project_parts (project_id, part_no, part_name, material,
-                                   qty, processes_json, spec)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-        """,
-        (project_id, payload.part_no, payload.part_name, payload.material,
-         payload.qty, json.dumps(payload.processes, ensure_ascii=False),
-         payload.spec),
+    # 校验 mold_id 归属
+    mold_id = payload.mold_id
+    if mold_id is not None:
+        m = db.fetch_one(
+            "SELECT id FROM molds WHERE id = %s AND project_id = %s",
+            (mold_id, project_id),
+        )
+        if m is None:
+            raise HTTPException(status_code=400, detail="mold_id 不属于该项目")
+
+    # 自动生成零件号：<part_type>-<sort_no:02d>，例 die-02
+    part_type = payload.part_type
+    sort_no   = payload.sort_no
+    part_no   = payload.part_no
+
+    if not part_no:
+        if not part_type:
+            raise HTTPException(status_code=400, detail="part_no 或 part_type+sort_no 至少提供一个")
+        if sort_no is None:
+            # 同模具 + 同 part_type 下自增
+            scope_mold = mold_id if mold_id is not None else None
+            row = db.fetch_one(
+                """
+                SELECT COALESCE(MAX(sort_no), 0) AS mx
+                FROM project_parts
+                WHERE project_id = %s
+                  AND COALESCE(mold_id, 0) = COALESCE(%s, 0)
+                  AND part_type = %s
+                """,
+                (project_id, scope_mold, part_type),
+            )
+            sort_no = (row["mx"] or 0) + 1
+        part_no = f"{part_type}-{sort_no:02d}"
+
+    try:
+        new_id = db.execute(
+            """
+            INSERT INTO project_parts (project_id, mold_id, part_type, sort_no,
+                                       part_no, part_name, material,
+                                       qty, processes_json, spec)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (project_id, mold_id, part_type, sort_no,
+             part_no, payload.part_name, payload.material,
+             payload.qty, json.dumps(payload.processes, ensure_ascii=False),
+             payload.spec),
+        )
+    except Exception as e:
+        if "part_no" in str(e):
+            raise HTTPException(status_code=409, detail=f"零件号冲突：{part_no}")
+        raise
+    return {"id": new_id, "part_no": part_no, "sort_no": sort_no, "mold_id": mold_id}
+
+
+# ---------------------------------------------------------------------------
+# 模具套 — Molds
+# ---------------------------------------------------------------------------
+
+def _next_mold_no(project_id: int) -> tuple[str, int]:
+    """生成 <project_no>-M<2位> 形式的模具号。"""
+    proj = db.fetch_one("SELECT project_no FROM projects WHERE id = %s", (project_id,))
+    row = db.fetch_one(
+        "SELECT COALESCE(MAX(sort_no), 0) AS mx FROM molds WHERE project_id = %s",
+        (project_id,),
     )
-    return {"id": new_id}
+    sort_no = (row["mx"] or 0) + 1
+    project_no = proj["project_no"] if proj else f"P{project_id}"
+    return f"{project_no}-M{sort_no:02d}", sort_no
+
+
+@router.get("/projects/{project_id}/molds")
+async def list_molds(project_id: int, user: CurrentUser = Depends(_require_internal)):
+    p = db.fetch_one("SELECT id FROM projects WHERE id=%s AND tenant_id=%s",
+                     (project_id, user.tenant_id))
+    if p is None:
+        raise HTTPException(status_code=404)
+    rows = db.fetch_all(
+        """
+        SELECT m.id, m.mold_no, m.name, m.sort_no, m.status, m.remark,
+               m.created_at,
+               (SELECT COUNT(*) FROM project_parts pp WHERE pp.mold_id = m.id) AS part_count
+        FROM molds m
+        WHERE m.project_id = %s
+        ORDER BY m.sort_no ASC NULLS LAST, m.id ASC
+        """,
+        (project_id,),
+    )
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/projects/{project_id}/molds", status_code=201)
+async def create_mold(
+    project_id: int,
+    payload: MoldCreate,
+    user: CurrentUser = Depends(_require_internal),
+):
+    p = db.fetch_one("SELECT id, status FROM projects WHERE id=%s AND tenant_id=%s",
+                     (project_id, user.tenant_id))
+    if p is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if p["status"] != "drafted":
+        raise HTTPException(status_code=409, detail="只有 drafted 项目可以添加模具")
+
+    if payload.sort_no is None:
+        mold_no, sort_no = _next_mold_no(project_id)
+    else:
+        sort_no = payload.sort_no
+        proj = db.fetch_one("SELECT project_no FROM projects WHERE id=%s", (project_id,))
+        mold_no = f"{proj['project_no']}-M{sort_no:02d}"
+
+    try:
+        new_id = db.execute(
+            """
+            INSERT INTO molds (project_id, mold_no, name, sort_no, remark)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (project_id, mold_no, payload.name, sort_no, payload.remark),
+        )
+    except Exception as e:
+        if "mold_no" in str(e) or "uk_mold_project_sort" in str(e):
+            raise HTTPException(status_code=409, detail=f"模具编号/排序冲突：{mold_no}")
+        raise
+    return {"id": new_id, "mold_no": mold_no, "sort_no": sort_no}
+
+
+@router.delete("/molds/{mold_id}")
+async def delete_mold(mold_id: int, user: CurrentUser = Depends(_require_internal)):
+    row = db.fetch_one(
+        """
+        SELECT m.id, p.status, p.tenant_id,
+               (SELECT COUNT(*) FROM project_parts pp WHERE pp.mold_id = m.id) AS part_count
+        FROM molds m
+        JOIN projects p ON m.project_id = p.id
+        WHERE m.id = %s
+        """,
+        (mold_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+    if row["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=403)
+    if row["status"] != "drafted":
+        raise HTTPException(status_code=409, detail="只有 drafted 项目可以删除模具")
+    if row["part_count"] > 0:
+        raise HTTPException(status_code=409, detail=f"模具下还有 {row['part_count']} 个零件，请先删除零件")
+    db.execute("DELETE FROM molds WHERE id = %s", (mold_id,))
+    return {"deleted": True}
 
 
 @router.delete("/projects/{project_id}/parts/{part_id}")
@@ -495,6 +654,59 @@ async def delete_process(
     return {"deleted": True}
 
 
+@router.get("/processes/{process_id}/faces")
+async def list_or_upsert_faces(
+    process_id: int,
+    labels: Optional[str] = None,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """返回工序下面的面列表；若传了 labels=A,B，则自动插入缺失项后返回 ids。"""
+    # 校验归属
+    row = db.fetch_one(
+        """
+        SELECT pp.id, p.tenant_id
+        FROM project_processes pp
+        JOIN projects p ON pp.project_id = p.id
+        WHERE pp.id = %s
+        """,
+        (process_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+    if row["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=403)
+
+    # 若传 labels，则先 upsert
+    if labels:
+        label_list = [s.strip().upper() for s in labels.split(",") if s.strip()]
+        # 校验
+        for lb in label_list:
+            if lb not in "ABCDEF":
+                raise HTTPException(status_code=400, detail=f"非法面标签：{lb}")
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                for lb in label_list:
+                    cur.execute(
+                        """
+                        INSERT INTO process_faces (process_id, face_label)
+                        VALUES (%s, %s)
+                        ON CONFLICT (process_id, face_label) DO NOTHING
+                        """,
+                        (process_id, lb),
+                    )
+
+    # 返回
+    rows = db.fetch_all(
+        "SELECT id, face_label FROM process_faces WHERE process_id = %s ORDER BY face_label",
+        (process_id,),
+    )
+    if labels:
+        wanted = set(s.strip().upper() for s in labels.split(","))
+        matched = [r["id"] for r in rows if r["face_label"] in wanted]
+        return {"items": rows, "ids": matched}
+    return {"items": rows}
+
+
 @router.post("/projects/{project_id}/attachments", status_code=201)
 async def upload_attachment(
     project_id: int,
@@ -667,7 +879,7 @@ async def trigger_decide(
         raise HTTPException(status_code=409,
                             detail=f"Project status must be 'confirmed', now '{project['status']}'")
 
-    # 读所有零件
+    # 读所有零件（优先从新表 project_processes 取；若为空回退到老字段 processes_json）
     parts = db.fetch_all(
         "SELECT id, part_no, processes_json FROM project_parts WHERE project_id = %s",
         (project_id,),
@@ -688,26 +900,64 @@ async def trigger_decide(
     with db.get_conn() as conn:
         with conn.cursor() as cur:
             for pt in parts:
-                procs_raw = pt.get("processes_json")
-                procs = (
-                    json.loads(procs_raw) if isinstance(procs_raw, str) and procs_raw
-                    else (procs_raw or [])
+                # 1) 优先从 project_processes 取结构化工序
+                cur.execute(
+                    """
+                    SELECT id, seq_no, process_code, method_name, faces
+                    FROM project_processes
+                    WHERE part_id = %s
+                    ORDER BY seq_no ASC
+                    """,
+                    (pt["id"],),
                 )
-                for proc in procs:
-                    sug = suggest_decision(proc)
-                    cur.execute(
-                        """
-                        INSERT INTO production_decisions
-                            (project_id, part_id, process_name,
-                             ai_suggestion, ai_reason, ai_source, is_forced,
-                             final_decision, status)
-                        VALUES (%s, %s, %s, %s, %s, 'rules', %s, %s, 'pending_review')
-                        """,
-                        (project_id, pt["id"], proc,
-                         sug.decision, sug.reason, 1 if sug.is_forced else 0,
-                         sug.decision),  # final_decision 初始 = AI 建议
+                structured = cur.fetchall()
+
+                if structured:
+                    for row in structured:
+                        # row 在默认 cursor 下是 tuple
+                        pid, seq, code, method_name, faces = row
+                        sug = suggest_decision(method_name)
+                        # faces 字符串 "A,B" → face_ids[] 需要查 process_faces（MVP 只存层级，不强制）
+                        # 为简化，face_ids 暂时传 NULL（scope_level=method 即可，不下沉到面）
+                        cur.execute(
+                            """
+                            INSERT INTO production_decisions
+                                (project_id, part_id, process_id, process_name,
+                                 scope_level,
+                                 ai_suggestion, ai_reason, ai_source, is_forced,
+                                 final_decision, status)
+                            VALUES (%s, %s, %s, %s, 'method',
+                                    %s, %s, 'rules', %s, %s, 'pending_review')
+                            """,
+                            (project_id, pt["id"], pid, method_name,
+                             sug.decision, sug.reason, sug.is_forced,
+                             sug.decision),
+                        )
+                        created += 1
+                else:
+                    # 2) 回退：老的逗号字符串 / JSON 列表字段
+                    procs_raw = pt.get("processes_json")
+                    procs = (
+                        json.loads(procs_raw) if isinstance(procs_raw, str) and procs_raw
+                        else (procs_raw or [])
                     )
-                    created += 1
+                    for proc in procs:
+                        sug = suggest_decision(proc)
+                        cur.execute(
+                            """
+                            INSERT INTO production_decisions
+                                (project_id, part_id, process_name,
+                                 scope_level,
+                                 ai_suggestion, ai_reason, ai_source, is_forced,
+                                 final_decision, status)
+                            VALUES (%s, %s, %s, 'method',
+                                    %s, %s, 'rules', %s, %s, 'pending_review')
+                            """,
+                            (project_id, pt["id"], proc,
+                             sug.decision, sug.reason, sug.is_forced,
+                             sug.decision),
+                        )
+                        created += 1
 
             # 项目进入 deciding 状态
             cur.execute(
@@ -832,7 +1082,7 @@ async def submit_decisions(
     existing = db.fetch_one(
         """
         SELECT id FROM workflow_approval_tasks
-        WHERE assignee_type = 'role' AND assignee_id = 'PRODUCTION_MANAGER'
+        WHERE assignee_type = 'role' AND assignee_id = 'ADMIN'
           AND node_id = %s AND status = 'pending'
         """,
         (f"production_decision:{project_id}",),
@@ -853,7 +1103,7 @@ async def submit_decisions(
                 """
                 INSERT INTO workflow_approval_tasks
                     (instance_id, node_id, assignee_type, assignee_id, status)
-                VALUES (%s, %s, 'role', 'PRODUCTION_MANAGER', 'pending')
+                VALUES (%s, %s, 'role', 'ADMIN', 'pending')
                 RETURNING id
                 """,
                 (str(fake_instance_id), f"production_decision:{project_id}"),
@@ -867,7 +1117,7 @@ async def submit_decisions(
                 INSERT INTO workflow_approval_records
                     (id, instance_id, node_id, action, actor_id,
                      assignee_type, assignee_id, comment, metadata_json, created_at)
-                VALUES (%s, %s, %s, 'submit', %s, 'role', 'PRODUCTION_MANAGER', %s, %s, %s)
+                VALUES (%s, %s, %s, 'submit', %s, 'role', 'ADMIN', %s, %s, %s)
                 """,
                 (str(record_uuid), str(fake_instance_id),
                  f"production_decision:{project_id}",
@@ -917,9 +1167,7 @@ async def list_pending_approvals(
 ):
     """当前用户能看到的待办。
 
-    匹配规则：
-      - assignee_type='user' AND assignee_id=user_id
-      - 或 assignee_type='role' AND assignee_id=UPPER(user.role)
+    方案 B：internal 租户的任意用户都能看到 role='ADMIN' 或 assignee=自己 的待办。
     """
     role_match = (user.role or "").upper()
 
@@ -931,7 +1179,7 @@ async def list_pending_approvals(
         WHERE t.status = 'pending'
           AND (
                (t.assignee_type = 'user' AND t.assignee_id = %s)
-            OR (t.assignee_type = 'role' AND t.assignee_id = %s)
+            OR (t.assignee_type = 'role' AND t.assignee_id IN ('ADMIN', %s))
           )
         ORDER BY t.created_at DESC
         LIMIT 100
@@ -983,7 +1231,7 @@ async def get_approval_detail(
     role_match = (user.role or "").upper()
     is_mine = (
         (task["assignee_type"] == "user" and task["assignee_id"] == str(user.user_id)) or
-        (task["assignee_type"] == "role" and task["assignee_id"] == role_match)
+        (task["assignee_type"] == "role" and task["assignee_id"] in ("ADMIN", role_match))
     )
     if not is_mine:
         raise HTTPException(status_code=403, detail="Not your task")
@@ -1059,7 +1307,41 @@ async def get_approval_detail(
                 v["unit_price"] = float(v["unit_price"])
             if v.get("submitted_at"):
                 v["submitted_at"] = v["submitted_at"].isoformat()
-        payload = {"request": req, "quotations": invs}
+
+        # 新：5 层 scope_items + quotation_lines 矩阵
+        scope_items = db.fetch_all(
+            """
+            SELECT * FROM v_outsource_scope_display
+            WHERE request_id = %s
+            ORDER BY scope_item_id
+            """,
+            (request_id,),
+        )
+
+        quotation_lines = db.fetch_all(
+            """
+            SELECT ql.id AS line_id, ql.quotation_id, ql.scope_item_id,
+                   ql.unit_price, ql.lead_time_days, ql.note,
+                   i.id AS invitation_id, i.supplier_id,
+                   s.name AS supplier_name
+            FROM outsource_quotation_lines ql
+            JOIN outsource_quotations q ON ql.quotation_id = q.id
+            JOIN outsource_request_invitations i ON q.invitation_id = i.id
+            JOIN suppliers s ON i.supplier_id = s.id
+            WHERE i.request_id = %s AND i.invitation_status = 'quoted'
+            ORDER BY ql.scope_item_id, ql.unit_price ASC
+            """,
+            (request_id,),
+        )
+        for l in quotation_lines:
+            l["unit_price"] = float(l["unit_price"])
+
+        payload = {
+            "request": req,
+            "quotations": invs,
+            "scope_items": scope_items,
+            "quotation_lines": quotation_lines,
+        }
 
     # Approval history
     history = db.fetch_all(
@@ -1106,7 +1388,7 @@ async def act_approval(
     role_match = (user.role or "").upper()
     is_mine = (
         (task["assignee_type"] == "user" and task["assignee_id"] == str(user.user_id)) or
-        (task["assignee_type"] == "role" and task["assignee_id"] == role_match)
+        (task["assignee_type"] == "role" and task["assignee_id"] in ("ADMIN", role_match))
     )
     if not is_mine:
         raise HTTPException(status_code=403, detail="Not your task")
@@ -1239,6 +1521,41 @@ async def act_approval(
                             )
                             outsource_request_id = cur.fetchone()[0]
 
+                            # ===== 按决策行自动创建 scope_items =====
+                            # 读出所有 outsource 决策行（含 scope 信息）
+                            cur.execute(
+                                """
+                                SELECT d.id, d.part_id, d.process_id, d.process_name,
+                                       d.scope_level, d.face_ids,
+                                       pp.mold_id, pp.qty AS part_qty
+                                FROM production_decisions d
+                                JOIN project_parts pp ON d.part_id = pp.id
+                                WHERE d.project_id = %s AND d.final_decision = 'outsource'
+                                ORDER BY d.id
+                                """,
+                                (project_id,),
+                            )
+                            dec_rows = cur.fetchall()
+                            for idx, drow in enumerate(dec_rows, start=1):
+                                d_id, part_id, process_id, proc_name, \
+                                    scope_level, face_ids, mold_id, part_qty = drow
+                                level = scope_level or ('face' if face_ids else 'method')
+                                desc = f"决策行 #{d_id}: {proc_name}" + (
+                                    f" (面: {face_ids})" if face_ids else ""
+                                )
+                                cur.execute(
+                                    """
+                                    INSERT INTO outsource_scope_items
+                                        (request_id, scope_level, project_id, mold_id,
+                                         part_id, process_id, face_ids,
+                                         quantity, description, sort_no, status)
+                                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'draft')
+                                    """,
+                                    (outsource_request_id, level, project_id, mold_id,
+                                     part_id, process_id, face_ids,
+                                     part_qty or 1, desc, idx),
+                                )
+
                 else:  # reject
                     # 决策行退回 pending_review
                     cur.execute(
@@ -1274,10 +1591,16 @@ class OutsourceRequestUpdate(BaseModel):
 
 
 class AwardAction(BaseModel):
-    """采购经理审批时的特殊载荷 — approve 时必须带 awarded_invitation_id。"""
+    """采购经理审批时的特殊载荷。
+    两种中标模式：
+      - 传统整单：approve + awarded_invitation_id（兼容老前端，不传 awarded_lines）
+      - 逐项中标：approve + awarded_lines=[quotation_line_id, ...]（新前端），
+                  每个 line 生成一张 outsource_order
+    """
     action: str = Field(..., pattern="^(approve|reject)$")
     comment: Optional[str] = None
-    awarded_invitation_id: Optional[int] = None  # approve + 非空
+    awarded_invitation_id: Optional[int] = None   # 传统整单中标
+    awarded_lines: Optional[list[int]] = None     # 新：逐项中标（quotation_line_id 数组）
 
 
 def _next_order_no() -> str:
@@ -1423,6 +1746,155 @@ async def update_outsource_request(
         tuple(params),
     )
     return {"updated": True}
+
+
+# ---------------------------------------------------------------------------
+# 委外项 Scope Items — 支持 5 层粒度（project/mold/part/method/face）
+# ---------------------------------------------------------------------------
+
+class ScopeItemCreate(BaseModel):
+    scope_level: str                   # project / mold / part / method / face
+    mold_id:    Optional[int] = None
+    part_id:    Optional[int] = None
+    process_id: Optional[int] = None
+    face_ids:   Optional[list[int]] = None
+    quantity:   int = 1
+    description: Optional[str] = None
+
+
+@router.get("/outsource-requests/{req_id}/scope-items")
+async def list_scope_items(req_id: int, user: CurrentUser = Depends(_require_internal)):
+    # 归属校验
+    req = db.fetch_one(
+        """
+        SELECT r.id, p.tenant_id
+        FROM outsource_requests r
+        JOIN projects p ON r.project_id = p.id
+        WHERE r.id = %s
+        """,
+        (req_id,),
+    )
+    if req is None or req["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+
+    rows = db.fetch_all(
+        """
+        SELECT v.*, s.sort_no
+        FROM v_outsource_scope_display v
+        JOIN outsource_scope_items s ON s.id = v.scope_item_id
+        WHERE v.request_id = %s
+        ORDER BY s.sort_no NULLS LAST, v.scope_item_id
+        """,
+        (req_id,),
+    )
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/outsource-requests/{req_id}/scope-items", status_code=201)
+async def add_scope_item(
+    req_id: int,
+    payload: ScopeItemCreate,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """新增委外项。根据 scope_level 校验必填字段：
+      - project : 不需额外
+      - mold    : mold_id
+      - part    : part_id
+      - method  : part_id + process_id
+      - face    : part_id + process_id + face_ids
+    """
+    req = db.fetch_one(
+        """
+        SELECT r.id, r.status, r.project_id, p.tenant_id
+        FROM outsource_requests r
+        JOIN projects p ON r.project_id = p.id
+        WHERE r.id = %s
+        """,
+        (req_id,),
+    )
+    if req is None or req["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+    if req["status"] != "draft":
+        raise HTTPException(status_code=409, detail="只有 draft 询价单可以编辑委外项")
+
+    # 校验必填 + 归属
+    level = payload.scope_level
+    if level not in ("project", "mold", "part", "method", "face"):
+        raise HTTPException(status_code=400, detail=f"未知 scope_level: {level}")
+
+    project_id = req["project_id"]
+    mold_id    = payload.mold_id
+    part_id    = payload.part_id
+    process_id = payload.process_id
+    face_ids   = payload.face_ids or []
+
+    if level == "mold" and mold_id is None:
+        raise HTTPException(status_code=400, detail="mold 级需要 mold_id")
+    if level == "part" and part_id is None:
+        raise HTTPException(status_code=400, detail="part 级需要 part_id")
+    if level == "method" and (part_id is None or process_id is None):
+        raise HTTPException(status_code=400, detail="method 级需要 part_id 和 process_id")
+    if level == "face" and (part_id is None or process_id is None or not face_ids):
+        raise HTTPException(status_code=400, detail="face 级需要 part_id、process_id 和 face_ids")
+
+    # 补齐 mold_id（从 part 取）
+    if part_id is not None and mold_id is None:
+        part = db.fetch_one(
+            "SELECT mold_id FROM project_parts WHERE id=%s AND project_id=%s",
+            (part_id, project_id),
+        )
+        if part:
+            mold_id = part["mold_id"]
+
+    # sort_no
+    row = db.fetch_one(
+        "SELECT COALESCE(MAX(sort_no), 0) AS mx FROM outsource_scope_items WHERE request_id = %s",
+        (req_id,),
+    )
+    sort_no = (row["mx"] or 0) + 1
+
+    try:
+        new_id = db.execute(
+            """
+            INSERT INTO outsource_scope_items
+                (request_id, scope_level, project_id, mold_id, part_id,
+                 process_id, face_ids, quantity, description, sort_no)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (req_id, level, project_id, mold_id, part_id,
+             process_id, face_ids if face_ids else None,
+             payload.quantity, payload.description, sort_no),
+        )
+    except Exception as e:
+        if "ck_scope_required" in str(e):
+            raise HTTPException(status_code=400, detail="scope_level 与字段组合不匹配")
+        if "ck_scope_level" in str(e):
+            raise HTTPException(status_code=400, detail="非法 scope_level")
+        raise
+    return {"id": new_id, "sort_no": sort_no}
+
+
+@router.delete("/scope-items/{item_id}")
+async def delete_scope_item(item_id: int, user: CurrentUser = Depends(_require_internal)):
+    row = db.fetch_one(
+        """
+        SELECT s.id, r.status, p.tenant_id
+        FROM outsource_scope_items s
+        JOIN outsource_requests r ON s.request_id = r.id
+        JOIN projects p ON r.project_id = p.id
+        WHERE s.id = %s
+        """,
+        (item_id,),
+    )
+    if row is None:
+        raise HTTPException(status_code=404)
+    if row["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=403)
+    if row["status"] != "draft":
+        raise HTTPException(status_code=409, detail="只有 draft 询价单可以删除委外项")
+    db.execute("DELETE FROM outsource_scope_items WHERE id = %s", (item_id,))
+    return {"deleted": True}
 
 
 # ---------------------------------------------------------------------------
@@ -1620,7 +2092,7 @@ async def close_quoting(
                     """
                     INSERT INTO workflow_approval_tasks
                         (instance_id, node_id, assignee_type, assignee_id, status)
-                    VALUES (%s, %s, 'role', 'PURCHASING_MANAGER', 'pending')
+                    VALUES (%s, %s, 'role', 'ADMIN', 'pending')
                     RETURNING id
                     """,
                     (str(fake_instance_id), node_id),
@@ -1633,7 +2105,7 @@ async def close_quoting(
                     INSERT INTO workflow_approval_records
                         (id, instance_id, node_id, action, actor_id,
                          assignee_type, assignee_id, comment, metadata_json, created_at)
-                    VALUES (%s, %s, %s, 'submit', %s, 'role', 'PURCHASING_MANAGER',
+                    VALUES (%s, %s, %s, 'submit', %s, 'role', 'ADMIN',
                             %s, %s, %s)
                     """,
                     (str(uuid.uuid4()), str(fake_instance_id), node_id,
@@ -1709,21 +2181,25 @@ async def award_outsource(
     role_match = (user.role or "").upper()
     is_mine = (
         (task["assignee_type"] == "user" and task["assignee_id"] == str(user.user_id)) or
-        (task["assignee_type"] == "role" and task["assignee_id"] == role_match)
+        (task["assignee_type"] == "role" and task["assignee_id"] in ("ADMIN", role_match))
     )
     if not is_mine:
         raise HTTPException(status_code=403, detail="Not your task")
 
     request_id = int(node.split(":", 1)[1])
 
-    # approve 必须带 awarded_invitation_id
-    if payload.action == "approve" and not payload.awarded_invitation_id:
-        raise HTTPException(status_code=400,
-                            detail="approve 时必须指定中标邀请 (awarded_invitation_id)")
+    # 判断中标模式：逐项 or 整单
+    use_lines = bool(payload.awarded_lines)
 
-    # 如果选了 awarded，校验：属于本询价单且已报价
-    awarded_quote = None
+    # approve 校验
     if payload.action == "approve":
+        if not use_lines and not payload.awarded_invitation_id:
+            raise HTTPException(status_code=400,
+                                detail="approve 时必须指定 awarded_invitation_id 或 awarded_lines")
+
+    # 整单模式的数据加载
+    awarded_quote = None
+    if payload.action == "approve" and not use_lines:
         awarded_quote = db.fetch_one(
             """
             SELECT q.id AS quotation_id, q.unit_price, q.lead_time_days,
@@ -1742,9 +2218,46 @@ async def award_outsource(
         if awarded_quote["request_id"] != request_id:
             raise HTTPException(status_code=400, detail="邀请不属于该询价单")
 
+    # 逐项模式的数据加载
+    awarded_line_rows = []
+    if payload.action == "approve" and use_lines:
+        # 查所有待中标的行 + 它们的 scope_item / 报价 / 供应商
+        if not payload.awarded_lines:
+            raise HTTPException(status_code=400, detail="awarded_lines 为空")
+        placeholders = ",".join(["%s"] * len(payload.awarded_lines))
+        awarded_line_rows = db.fetch_all(
+            f"""
+            SELECT ql.id AS line_id, ql.scope_item_id, ql.unit_price, ql.lead_time_days,
+                   ql.note, ql.quotation_id,
+                   i.id AS invitation_id, i.supplier_id, i.tenant_id AS processor_tenant_id,
+                   i.request_id,
+                   s.scope_level, s.quantity AS item_qty
+            FROM outsource_quotation_lines ql
+            JOIN outsource_quotations q ON ql.quotation_id = q.id
+            JOIN outsource_request_invitations i ON q.invitation_id = i.id
+            JOIN outsource_scope_items s ON ql.scope_item_id = s.id
+            WHERE ql.id IN ({placeholders})
+            """,
+            tuple(payload.awarded_lines),
+        )
+        if len(awarded_line_rows) != len(payload.awarded_lines):
+            raise HTTPException(status_code=400, detail="部分 quotation_line_id 找不到")
+        # 校验都属于本 request
+        for r in awarded_line_rows:
+            if r["request_id"] != request_id:
+                raise HTTPException(status_code=400,
+                                    detail=f"line {r['line_id']} 不属于当前询价单")
+        # 校验每个 scope_item 只选了 1 个中标
+        from collections import Counter
+        counts = Counter(r["scope_item_id"] for r in awarded_line_rows)
+        dup = [sid for sid, c in counts.items() if c > 1]
+        if dup:
+            raise HTTPException(status_code=400,
+                                detail=f"scope_item {dup} 不能同时选多个中标")
+
     now = datetime.utcnow()
-    order_id = None
-    order_no = None
+    order_ids: list[int] = []
+    order_nos: list[str] = []
 
     with db.get_conn() as conn:
         with conn.cursor() as cur:
@@ -1760,7 +2273,10 @@ async def award_outsource(
                 (str(uuid.uuid4()), task["instance_hex"], node, action_value,
                  str(user.user_id), task["assignee_type"], task["assignee_id"],
                  payload.comment or "",
-                 json.dumps({"awarded_invitation_id": payload.awarded_invitation_id}, ensure_ascii=False),
+                 json.dumps({
+                     "awarded_invitation_id": payload.awarded_invitation_id,
+                     "awarded_lines": payload.awarded_lines,
+                 }, ensure_ascii=False),
                  now),
             )
 
@@ -1788,18 +2304,71 @@ async def award_outsource(
                      "actor_id": user.user_id,
                      "action": action_value,
                      "awarded_invitation_id": payload.awarded_invitation_id,
+                     "awarded_lines": payload.awarded_lines,
                      "comment": payload.comment,
                  }, ensure_ascii=False),
                  now),
             )
 
             # 4. 业务后处理
-            if action_value == "approve":
-                # 创建 outsource_orders
+            if action_value == "approve" and use_lines:
+                # 逐项模式：每个 awarded_line 一张加工单
+                for r in awarded_line_rows:
+                    qty = r["item_qty"] or 1
+                    unit_price = float(r["unit_price"])
+                    total = unit_price * qty
+                    one_order_no = _next_order_no()
+
+                    cur.execute(
+                        """
+                        INSERT INTO outsource_orders
+                            (request_id, quotation_id, quotation_line_id, scope_item_id,
+                             supplier_id, tenant_id,
+                             order_no, unit_price, quantity, total_amount,
+                             lead_time_days, status, awarded_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'awarded', %s)
+                        RETURNING id
+                        """,
+                        (request_id, r["quotation_id"], r["line_id"], r["scope_item_id"],
+                         r["supplier_id"], r["processor_tenant_id"],
+                         one_order_no, unit_price, qty, total,
+                         r["lead_time_days"], now),
+                    )
+                    oid = cur.fetchone()[0]
+                    order_ids.append(oid)
+                    order_nos.append(one_order_no)
+
+                    cur.execute(
+                        """
+                        INSERT INTO outsource_order_status_events
+                            (order_id, from_status, to_status, changed_by, note, occurred_at)
+                        VALUES (%s, NULL, 'awarded', %s, %s, %s)
+                        """,
+                        (oid, user.user_id,
+                         f"采购经理批准中标 (line {r['line_id']})", now),
+                    )
+
+                    # 更新 scope_item 状态
+                    cur.execute(
+                        """
+                        UPDATE outsource_scope_items
+                        SET status = 'awarded', winning_quotation_line_id = %s
+                        WHERE id = %s
+                        """,
+                        (r["line_id"], r["scope_item_id"]),
+                    )
+
+                cur.execute(
+                    "UPDATE outsource_requests SET status='awarded' WHERE id=%s",
+                    (request_id,),
+                )
+
+            elif action_value == "approve":
+                # 整单模式（兼容老路径）
                 qty = awarded_quote["quantity"] or 1
                 unit_price = float(awarded_quote["unit_price"])
                 total = unit_price * qty
-                order_no = _next_order_no()
+                one_order_no = _next_order_no()
 
                 cur.execute(
                     """
@@ -1812,22 +2381,22 @@ async def award_outsource(
                     """,
                     (awarded_quote["request_id"], awarded_quote["quotation_id"],
                      awarded_quote["supplier_id"], awarded_quote["processor_tenant_id"],
-                     order_no, unit_price, qty, total,
+                     one_order_no, unit_price, qty, total,
                      awarded_quote["lead_time_days"], now),
                 )
-                order_id = cur.fetchone()[0]
+                oid = cur.fetchone()[0]
+                order_ids.append(oid)
+                order_nos.append(one_order_no)
 
-                # 加工单状态事件
                 cur.execute(
                     """
                     INSERT INTO outsource_order_status_events
                         (order_id, from_status, to_status, changed_by, note, occurred_at)
                     VALUES (%s, NULL, 'awarded', %s, '采购经理批准中标', %s)
                     """,
-                    (order_id, user.user_id, now),
+                    (oid, user.user_id, now),
                 )
 
-                # 询价单 → awarded
                 cur.execute(
                     """
                     UPDATE outsource_requests
@@ -1836,6 +2405,7 @@ async def award_outsource(
                     """,
                     (awarded_quote["quotation_id"], request_id),
                 )
+
             else:
                 # reject
                 cur.execute(
@@ -1846,8 +2416,9 @@ async def award_outsource(
     return {
         "status": "ok",
         "action": action_value,
-        "outsource_order_id": order_id,
-        "order_no": order_no,
+        "mode": "lines" if use_lines else ("single" if order_ids else "reject"),
+        "outsource_order_ids": order_ids,
+        "order_nos": order_nos,
     }
 
 
@@ -1932,4 +2503,561 @@ async def get_order(
         if e.get("occurred_at"):
             e["occurred_at"] = e["occurred_at"].isoformat()
 
-    return {"order": row, "events": events}
+    # 关联的材料方发货照片
+    ship_rows = db.fetch_all(
+        """
+        SELECT sh.shipment_no, sh.batch_no, sh.qty_shipped, sh.carrier,
+               sh.photo_paths, sh.shipped_at,
+               mpo.po_no, mpo.material_code, mpo.spec
+        FROM material_shipments sh
+        JOIN material_purchase_orders mpo ON sh.po_id = mpo.id
+        WHERE mpo.project_id = (SELECT project_id FROM outsource_requests WHERE id = %s)
+          AND sh.photo_paths IS NOT NULL
+        ORDER BY sh.shipped_at DESC
+        """,
+        (row["request_id"],),
+    )
+    for r in ship_rows:
+        if r.get("qty_shipped"): r["qty_shipped"] = float(r["qty_shipped"])
+        if r.get("shipped_at"):
+            r["shipped_at"] = r["shipped_at"].isoformat() if hasattr(r["shipped_at"], "isoformat") else r["shipped_at"]
+
+    return {
+        "order": row,
+        "events": events,
+        "shipments_detail": ship_rows,
+    }
+
+
+
+# =============================================================================
+# Stage 4 自制分支：查看/管理自制生产单 + 给材料方的采购单 (PO)
+# =============================================================================
+
+class POCreate(BaseModel):
+    project_id: int
+    mold_id: Optional[int] = None
+    supplier_id: int
+    material_code: str
+    spec: Optional[str] = None
+    qty: float = Field(..., gt=0)
+    unit: str = "kg"
+    unit_price: Optional[float] = None
+    required_date: Optional[str] = None
+    remark: Optional[str] = None
+
+
+class ReceivePayload(BaseModel):
+    shipment_id: int
+    received_qty: Optional[float] = None       # 省略时取 shipment.qty_shipped
+    remark: Optional[str] = None
+
+
+def _next_po_no(project_no: str) -> str:
+    """生成采购单号：MP-<project_no>-<random 4>."""
+    return f"MP-{project_no}-{uuid.uuid4().hex[:4].upper()}"
+
+
+def _apply_moq_rule(material_code: str, spec: Optional[str],
+                    supplier_id: int, qty: float) -> tuple[float, float, str | None]:
+    """根据 MOQ 规则调整数量。返回 (adj_qty, surplus_qty, policy)。
+    未命中规则时返回 (qty, 0, None)。
+    """
+    rule = db.fetch_one(
+        """
+        SELECT min_qty, multiple_of, surplus_policy
+        FROM moq_rules
+        WHERE material_code = %s
+          AND COALESCE(spec, '') = COALESCE(%s, '')
+          AND (supplier_id IS NULL OR supplier_id = %s)
+          AND is_active = TRUE
+        ORDER BY supplier_id NULLS LAST
+        LIMIT 1
+        """,
+        (material_code, spec, supplier_id),
+    )
+    if rule is None:
+        return qty, 0.0, None
+
+    min_q = rule["min_qty"] or 1
+    mul   = rule["multiple_of"] or 1
+    adj   = max(qty, min_q)
+    # 向上取到 multiple_of
+    if mul > 1:
+        remainder = adj % mul
+        if remainder > 0:
+            adj = adj + (mul - remainder)
+    surplus = max(0.0, adj - qty)
+    return float(adj), float(surplus), rule["surplus_policy"]
+
+
+@router.get("/production-orders")
+async def list_internal_orders(
+    project_id: Optional[int] = None,
+    user: CurrentUser = Depends(_require_internal),
+):
+    where = "WHERE p.tenant_id = %s"
+    params: list[Any] = [user.tenant_id]
+    if project_id is not None:
+        where += " AND ipo.project_id = %s"
+        params.append(project_id)
+
+    rows = db.fetch_all(
+        f"""
+        SELECT ipo.*, p.project_no, p.name AS project_name,
+               pp.part_no, pp.part_name,
+               pr.process_code, pr.method_name,
+               m.mold_no
+        FROM internal_production_orders ipo
+        JOIN projects p ON ipo.project_id = p.id
+        LEFT JOIN project_parts pp ON ipo.part_id = pp.id
+        LEFT JOIN project_processes pr ON ipo.process_id = pr.id
+        LEFT JOIN molds m ON ipo.mold_id = m.id
+        {where}
+        ORDER BY ipo.created_at DESC
+        """,
+        tuple(params),
+    )
+    return {"items": rows, "total": len(rows)}
+
+
+@router.get("/material-pos")
+async def list_material_pos(
+    project_id: Optional[int] = None,
+    supplier_id: Optional[int] = None,
+    user: CurrentUser = Depends(_require_internal),
+):
+    where = "WHERE p.tenant_id = %s"
+    params: list[Any] = [user.tenant_id]
+    if project_id is not None:
+        where += " AND mpo.project_id = %s"
+        params.append(project_id)
+    if supplier_id is not None:
+        where += " AND mpo.supplier_id = %s"
+        params.append(supplier_id)
+
+    rows = db.fetch_all(
+        f"""
+        SELECT mpo.*, p.project_no, p.name AS project_name,
+               s.name AS supplier_name,
+               m.mold_no
+        FROM material_purchase_orders mpo
+        JOIN projects p ON mpo.project_id = p.id
+        JOIN suppliers s ON mpo.supplier_id = s.id
+        LEFT JOIN molds m ON mpo.mold_id = m.id
+        {where}
+        ORDER BY mpo.created_at DESC
+        LIMIT 100
+        """,
+        tuple(params),
+    )
+    for r in rows:
+        for k in ("unit_price", "total_amount", "qty", "moq_surplus_qty"):
+            if r.get(k) is not None:
+                r[k] = float(r[k])
+    return {"items": rows, "total": len(rows)}
+
+
+@router.post("/material-pos", status_code=201)
+async def create_material_po(
+    payload: POCreate,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """新建采购单：会自动应用 MOQ 规则（超量写入 moq_surplus_qty）。"""
+    proj = db.fetch_one(
+        "SELECT id, project_no, tenant_id FROM projects WHERE id=%s",
+        (payload.project_id,),
+    )
+    if proj is None or proj["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    # MOQ 规则
+    adj_qty, surplus, policy = _apply_moq_rule(
+        payload.material_code, payload.spec, payload.supplier_id, payload.qty,
+    )
+    total = (adj_qty * payload.unit_price) if payload.unit_price else None
+    po_no = _next_po_no(proj["project_no"])
+
+    # 找材料方租户 id
+    tenant = db.fetch_one(
+        "SELECT id FROM tenants WHERE supplier_id=%s AND tenant_type='material' LIMIT 1",
+        (payload.supplier_id,),
+    )
+
+    new_id = db.execute(
+        """
+        INSERT INTO material_purchase_orders
+            (po_no, project_id, mold_id, supplier_id, tenant_id,
+             material_code, spec, qty, unit, unit_price, total_amount,
+             required_date, status, created_by, moq_surplus_qty, remark)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'sent', %s, %s, %s)
+        RETURNING id
+        """,
+        (po_no, payload.project_id, payload.mold_id, payload.supplier_id,
+         tenant["id"] if tenant else None,
+         payload.material_code, payload.spec, adj_qty, payload.unit,
+         payload.unit_price, total,
+         payload.required_date, user.user_id, surplus, payload.remark),
+    )
+
+    return {
+        "id": new_id, "po_no": po_no,
+        "qty": adj_qty, "moq_surplus_qty": surplus,
+        "moq_policy": policy,
+    }
+
+
+@router.post("/material-pos/{po_id}/receive")
+async def receive_po(
+    po_id: int,
+    payload: ReceivePayload,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """我方确认收料 → 更新订单/发货状态 → MOQ 余量入库。"""
+    po = db.fetch_one(
+        """
+        SELECT mpo.*, p.tenant_id
+        FROM material_purchase_orders mpo
+        JOIN projects p ON mpo.project_id = p.id
+        WHERE mpo.id = %s
+        """,
+        (po_id,),
+    )
+    if po is None or po["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+
+    ship = db.fetch_one(
+        "SELECT * FROM material_shipments WHERE id = %s AND po_id = %s",
+        (payload.shipment_id, po_id),
+    )
+    if ship is None:
+        raise HTTPException(status_code=400, detail="shipment 不属于该订单")
+    if ship["status"] not in ("shipped",):
+        raise HTTPException(status_code=409, detail=f"shipment 当前 '{ship['status']}' 不能确认收料")
+
+    now = datetime.utcnow()
+    received = payload.received_qty if payload.received_qty is not None else ship["qty_shipped"]
+
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE material_shipments SET status='received', received_at=%s, remark=COALESCE(%s, remark) WHERE id=%s",
+                (now, payload.remark, payload.shipment_id),
+            )
+            cur.execute(
+                "UPDATE material_purchase_orders SET status='received' WHERE id=%s",
+                (po_id,),
+            )
+
+            # MOQ 余量入库：仅当 moq_surplus_qty > 0 且 policy=stock
+            surplus_qty = float(po["moq_surplus_qty"] or 0)
+            if surplus_qty > 0:
+                # 计算收到的实际 surplus（保守：如果 received < adj_qty，按比例）
+                adj_qty = float(po["qty"])
+                effective_surplus = max(0.0, float(received) - (adj_qty - surplus_qty))
+                if effective_surplus > 0:
+                    cur.execute(
+                        """
+                        INSERT INTO inventory
+                            (material_code, spec, batch_no, qty, unit,
+                             inventory_type, source_type, source_id,
+                             warehouse_location, remark)
+                        VALUES (%s, %s, %s, %s, %s, 'moq_surplus', 'material_shipment', %s,
+                                NULL, %s)
+                        """,
+                        (po["material_code"], po["spec"], ship["batch_no"],
+                         effective_surplus, po["unit"],
+                         payload.shipment_id,
+                         f"PO {po['po_no']} 的 MOQ 余量自动入库"),
+                    )
+
+    return {
+        "status": "received",
+        "received_qty": received,
+        "moq_surplus_stocked": surplus_qty > 0,
+    }
+
+
+# =============================================================================
+# 工具：审批 approve 生产决策 → 自动生成自制单
+# =============================================================================
+# NOTE: 实际触发点在审批 act_approval 里（已经有项目状态变更逻辑）。
+#       这里只提供一个独立接口供手动触发/测试。
+
+@router.post("/projects/{project_id}/generate-self-orders")
+async def generate_self_orders(
+    project_id: int,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """按 production_decisions.final_decision='self_made' 的行批量生成 internal_production_orders。
+
+    幂等：同一 (project_id, part_id, process_id) 只生成一张。
+    """
+    proj = db.fetch_one(
+        "SELECT id, project_no, tenant_id FROM projects WHERE id=%s",
+        (project_id,),
+    )
+    if proj is None or proj["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+
+    decisions = db.fetch_all(
+        """
+        SELECT d.id, d.part_id, d.process_id,
+               pp.mold_id, pp.qty AS part_qty
+        FROM production_decisions d
+        JOIN project_parts pp ON d.part_id = pp.id
+        WHERE d.project_id = %s AND d.final_decision = 'self_made'
+        """,
+        (project_id,),
+    )
+    if not decisions:
+        return {"created": 0, "note": "没有自制决策行"}
+
+    now = datetime.utcnow()
+    created = 0
+    skipped = 0
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            for d in decisions:
+                # 幂等检查
+                cur.execute(
+                    """
+                    SELECT id FROM internal_production_orders
+                    WHERE project_id=%s AND part_id=%s
+                      AND COALESCE(process_id, 0) = COALESCE(%s, 0)
+                    LIMIT 1
+                    """,
+                    (project_id, d["part_id"], d["process_id"]),
+                )
+                if cur.fetchone():
+                    skipped += 1
+                    continue
+
+                # 查 part_no / process_code
+                cur.execute(
+                    "SELECT part_no FROM project_parts WHERE id=%s",
+                    (d["part_id"],),
+                )
+                part_no = cur.fetchone()[0] if cur.rowcount else "part"
+                proc_suffix = ""
+                if d["process_id"]:
+                    cur.execute(
+                        "SELECT process_code FROM project_processes WHERE id=%s",
+                        (d["process_id"],),
+                    )
+                    r = cur.fetchone()
+                    if r:
+                        proc_suffix = f"-{r[0]}"
+
+                order_no = f"IP-{proj['project_no']}-{part_no}{proc_suffix}-{created+1:02d}"
+
+                cur.execute(
+                    """
+                    INSERT INTO internal_production_orders
+                        (order_no, project_id, mold_id, part_id, process_id,
+                         qty, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                    """,
+                    (order_no, project_id, d["mold_id"], d["part_id"], d["process_id"],
+                     d["part_qty"] or 1),
+                )
+                created += 1
+
+    return {"created": created, "skipped": skipped}
+
+
+
+# =============================================================================
+# Stage 7-KANBAN：全流程节点追踪
+# =============================================================================
+
+from mvp import tracking as _tracking
+
+
+class HoldPayload(BaseModel):
+    reason: str
+    node_code: str
+
+
+@router.get("/tracking")
+async def list_tracking_all(user: CurrentUser = Depends(_require_internal)):
+    """看板：所有项目 × 10 节点的状态矩阵。"""
+    rows = db.fetch_all(
+        """
+        SELECT wt.project_id, wt.node_code, wt.node_name, wt.node_order,
+               wt.status, wt.started_at, wt.ended_at, wt.duration_hours,
+               wt.is_blocking, wt.blocker_reason, wt.remark,
+               p.project_no, p.name AS project_name, p.status AS project_status,
+               p.customer, p.deadline
+        FROM workflow_tracking wt
+        JOIN projects p ON wt.project_id = p.id
+        WHERE p.tenant_id = %s
+        ORDER BY p.id DESC, wt.node_order ASC
+        """,
+        (user.tenant_id,),
+    )
+    # 按 project 分组
+    projects: dict[int, dict] = {}
+    for r in rows:
+        pid = r["project_id"]
+        if pid not in projects:
+            projects[pid] = {
+                "project_id":    pid,
+                "project_no":    r["project_no"],
+                "project_name":  r["project_name"],
+                "project_status":r["project_status"],
+                "customer":      r["customer"],
+                "deadline":      r["deadline"],
+                "nodes": [],
+            }
+        if r.get("duration_hours") is not None:
+            r["duration_hours"] = float(r["duration_hours"])
+        projects[pid]["nodes"].append({
+            "code":   r["node_code"],
+            "name":   r["node_name"],
+            "order":  r["node_order"],
+            "status": r["status"],
+            "started_at":     r["started_at"],
+            "ended_at":       r["ended_at"],
+            "duration_hours": r["duration_hours"],
+            "is_blocking":    r["is_blocking"],
+            "blocker_reason": r["blocker_reason"],
+            "remark":         r["remark"],
+        })
+
+    return {"projects": list(projects.values()), "total": len(projects)}
+
+
+@router.post("/tracking/{project_id}/sync")
+async def sync_tracking(
+    project_id: int,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """根据现有数据回填/刷新 workflow_tracking 行（幂等）。"""
+    proj = db.fetch_one(
+        "SELECT id, status FROM projects WHERE id=%s AND tenant_id=%s",
+        (project_id, user.tenant_id),
+    )
+    if proj is None:
+        raise HTTPException(status_code=404)
+
+    _tracking.ensure_nodes(project_id)
+
+    # 1) drafting / confirmed / deciding / decided 基于 project.status
+    status = proj["status"]
+    order_map = {"drafted":1, "confirmed":2, "deciding":3, "decided":4, "completed":10, "cancelled":0}
+    code_flow = ["drafting","confirmed","deciding","decided"]
+    cur_pos = order_map.get(status, 1)
+    for i, code in enumerate(code_flow, start=1):
+        if i < cur_pos:
+            _tracking.track(project_id, code, "done", user.user_id)
+        elif i == cur_pos:
+            _tracking.track(project_id, code, "in_progress" if status != "decided" else "done", user.user_id)
+
+    # 2) purchasing / outsourcing 基于有没有相关订单
+    has_mpo = db.fetch_one(
+        "SELECT 1 FROM material_purchase_orders WHERE project_id=%s LIMIT 1",
+        (project_id,),
+    )
+    if has_mpo:
+        _tracking.track(project_id, "purchasing", "in_progress", user.user_id)
+        all_received = db.fetch_one(
+            """
+            SELECT CASE WHEN COUNT(*) FILTER (WHERE status != 'received') = 0 THEN 1 ELSE 0 END AS ok
+            FROM material_purchase_orders WHERE project_id=%s
+            """,
+            (project_id,),
+        )
+        if all_received and all_received["ok"]:
+            _tracking.track(project_id, "purchasing", "done", user.user_id)
+
+    has_oo = db.fetch_one(
+        """
+        SELECT 1 FROM outsource_orders o
+        JOIN outsource_requests r ON o.request_id=r.id
+        WHERE r.project_id=%s LIMIT 1
+        """,
+        (project_id,),
+    )
+    if has_oo:
+        _tracking.track(project_id, "outsourcing", "in_progress", user.user_id)
+        all_delivered = db.fetch_one(
+            """
+            SELECT CASE WHEN COUNT(*) FILTER (WHERE o.status != 'delivered') = 0 THEN 1 ELSE 0 END AS ok
+            FROM outsource_orders o
+            JOIN outsource_requests r ON o.request_id=r.id
+            WHERE r.project_id=%s
+            """,
+            (project_id,),
+        )
+        if all_delivered and all_delivered["ok"]:
+            _tracking.track(project_id, "outsourcing", "done", user.user_id)
+
+    # 3) producing 基于 internal_production_orders
+    has_ipo = db.fetch_one(
+        "SELECT 1 FROM internal_production_orders WHERE project_id=%s LIMIT 1",
+        (project_id,),
+    )
+    if has_ipo:
+        _tracking.track(project_id, "producing", "in_progress", user.user_id)
+        all_finished = db.fetch_one(
+            """
+            SELECT CASE WHEN COUNT(*) FILTER (WHERE status != 'finished') = 0 THEN 1 ELSE 0 END AS ok
+            FROM internal_production_orders WHERE project_id=%s
+            """,
+            (project_id,),
+        )
+        if all_finished and all_finished["ok"]:
+            _tracking.track(project_id, "producing", "done", user.user_id)
+
+    # 4) inspecting 基于 inspections 是否存在
+    has_insp = db.fetch_one("SELECT 1 FROM inspections WHERE project_id=%s LIMIT 1",
+                             (project_id,))
+    if has_insp:
+        _tracking.track(project_id, "inspecting", "in_progress", user.user_id)
+        has_pass = db.fetch_one(
+            "SELECT 1 FROM inspections WHERE project_id=%s AND result='pass' LIMIT 1",
+            (project_id,),
+        )
+        if has_pass:
+            _tracking.track(project_id, "inspecting", "done", user.user_id)
+
+    # 5) exception 基于 quality_exceptions
+    has_exc_open = db.fetch_one(
+        """
+        SELECT 1 FROM quality_exceptions
+        WHERE project_id=%s AND status NOT IN ('resolved','closed','cancelled')
+        LIMIT 1
+        """,
+        (project_id,),
+    )
+    has_exc_closed = db.fetch_one(
+        """
+        SELECT 1 FROM quality_exceptions
+        WHERE project_id=%s AND status IN ('resolved','closed')
+        LIMIT 1
+        """,
+        (project_id,),
+    )
+    if has_exc_open:
+        _tracking.track(project_id, "exception", "in_progress", user.user_id)
+    elif has_exc_closed:
+        _tracking.track(project_id, "exception", "done", user.user_id)
+
+    return {"synced": True, "project_id": project_id}
+
+
+@router.post("/tracking/{project_id}/hold")
+async def hold_node(
+    project_id: int,
+    payload: HoldPayload,
+    user: CurrentUser = Depends(_require_internal),
+):
+    proj = db.fetch_one(
+        "SELECT id FROM projects WHERE id=%s AND tenant_id=%s",
+        (project_id, user.tenant_id),
+    )
+    if proj is None: raise HTTPException(status_code=404)
+    _tracking.hold(project_id, payload.node_code, payload.reason, user.user_id)
+    return {"status": "on_hold"}
+

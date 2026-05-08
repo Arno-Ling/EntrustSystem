@@ -67,6 +67,26 @@
     </table>
   </div>
 
+  <!-- 委外项（scope_items） — 5 层粒度 -->
+  <div class="card" id="scopeCard" style="display:none;">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h2 style="margin:0;">🎯 委外项（5 层粒度）</h2>
+      <button class="primary" id="btnAddScope" onclick="openScopeModal()" style="display:none;">+ 添加委外项</button>
+    </div>
+    <table style="margin-top:14px;">
+      <thead><tr>
+        <th style="width:40px;">#</th>
+        <th>粒度</th>
+        <th>路径</th>
+        <th>数量</th>
+        <th>描述</th>
+        <th>状态</th>
+        <th style="width:60px;"></th>
+      </tr></thead>
+      <tbody id="scopeBody"><tr><td colspan="7" class="empty">—</td></tr></tbody>
+    </table>
+  </div>
+
   <!-- 邀请 + 报价看板（inviting / pending_award / awarded） -->
   <div class="card" id="invitationsCard" style="display:none;">
     <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -92,6 +112,32 @@
 </main>
 
 <div class="toast" id="toast"></div>
+
+<!-- 添加委外项 modal -->
+<div class="modal-bg" id="scopeModal">
+  <div class="modal" style="max-width:620px;">
+    <h3>+ 添加委外项</h3>
+    <form onsubmit="return doAddScope(event)">
+      <label>粒度</label>
+      <select name="scope_level" onchange="onScopeLevelChange(this.value)">
+        <option value="project">project — 整项目打包</option>
+        <option value="mold">mold — 一套模具打包</option>
+        <option value="part">part — 单个零件所有工序</option>
+        <option value="method" selected>method — 某零件某道工序</option>
+        <option value="face">face — 工序里的部分面</option>
+      </select>
+      <div id="scopeFields"></div>
+      <label>数量</label>
+      <input name="quantity" type="number" min="1" value="1">
+      <label>描述</label>
+      <input name="description" placeholder="例：die-01 的 P1 精铣 A,B 两面">
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeScopeModal()">取消</button>
+        <button type="submit" class="primary">添加</button>
+      </div>
+    </form>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 <script>
@@ -150,6 +196,13 @@
 
       // Candidates (仅 draft 状态显示)
       document.getElementById('candidatesCard').style.display = r.status === 'draft' ? 'block' : 'none';
+      document.getElementById('scopeCard').style.display = ['draft','inviting','pending_award'].includes(r.status) ? 'block' : 'none';
+      document.getElementById('btnAddScope').style.display = r.status === 'draft' ? 'inline-block' : 'none';
+      // Load scope items
+      if (document.getElementById('scopeCard').style.display === 'block') {
+        await loadScopeItems(r.status === 'draft');
+      }
+
       if (r.status === 'draft') {
         const cand = await App.api(`/api/internal/outsource-requests/${rid}/candidates`);
         const cbody = document.getElementById('candBody');
@@ -200,6 +253,146 @@
     }
   }
   window.load = load;
+
+  // ---------- Scope Items ----------
+  async function loadScopeItems(draft) {
+    const r = await App.api(`/api/internal/outsource-requests/${rid}/scope-items`);
+    const body = document.getElementById('scopeBody');
+    if (!r.items.length) {
+      body.innerHTML = `<tr><td colspan="7" class="empty">${draft ? '点【+ 添加委外项】按粒度拆分' : '此询价单没有委外项（旧版整单询价）'}</td></tr>`;
+      return;
+    }
+    body.innerHTML = r.items.map((it, i) => `
+      <tr>
+        <td>${i+1}</td>
+        <td><span class="badge ${it.scope_level === 'face' ? 'deciding' : 'drafted'}">${App.esc(it.scope_level)}</span></td>
+        <td><code style="font-size:11px;">${App.esc(it.display_path)}</code></td>
+        <td>${it.quantity}</td>
+        <td class="muted" style="max-width:260px;">${App.esc(it.description || '—')}</td>
+        <td><span class="badge ${it.status}">${it.status}</span></td>
+        <td>${draft ? `<button class="danger" onclick="delScope(${it.scope_item_id})">×</button>` : ''}</td>
+      </tr>`).join('');
+  }
+
+  // 项目+模具+零件+工序 缓存 (画 scope modal 用)
+  let _projectData = null;
+  async function ensureProjectData() {
+    if (_projectData) return _projectData;
+    const req = await App.api('/api/internal/outsource-requests/' + rid);
+    const pid = req.request.project_id;
+    _projectData = await App.api('/api/internal/projects/' + pid);
+    return _projectData;
+  }
+
+  window.openScopeModal = async () => {
+    document.getElementById('scopeModal').classList.add('show');
+    onScopeLevelChange('method');
+  };
+  window.closeScopeModal = () => document.getElementById('scopeModal').classList.remove('show');
+
+  window.onScopeLevelChange = async (level) => {
+    const d = await ensureProjectData();
+    const container = document.getElementById('scopeFields');
+
+    const moldOpts = '<option value="">（不限，项目级）</option>' +
+      (d.molds || []).map(m => `<option value="${m.id}">${App.esc(m.mold_no)}</option>`).join('');
+    const partOpts = (d.parts || []).map(p =>
+      `<option value="${p.id}" data-mold="${p.mold_id || ''}">${App.esc(p.part_no)} (${App.esc(p.part_type || '?')})</option>`
+    ).join('');
+
+    let html = '';
+    if (level === 'mold') {
+      html = `<label>模具 *</label><select name="mold_id" required><option value="">选择</option>${
+        (d.molds || []).map(m => `<option value="${m.id}">${App.esc(m.mold_no)}</option>`).join('')
+      }</select>`;
+    } else if (level === 'part') {
+      html = `<label>零件 *</label><select name="part_id" required><option value="">选择</option>${partOpts}</select>`;
+    } else if (level === 'method' || level === 'face') {
+      html = `<label>零件 *</label><select name="part_id" id="partSel" required onchange="onScopePartChange(this.value)"><option value="">选择</option>${partOpts}</select>
+              <label>工序 *</label><select name="process_id" id="procSel" required><option value="">先选零件</option></select>`;
+      if (level === 'face') {
+        html += `<label>面（多选 A-F）*</label><div id="faceBox" style="display:flex; gap:10px; padding:8px 0;">
+                  <span class="muted">先选工序</span>
+                </div>`;
+      }
+    }
+    container.innerHTML = html;
+  };
+
+  window.onScopePartChange = async (part_id) => {
+    if (!part_id) return;
+    const d = await ensureProjectData();
+    const part = (d.parts || []).find(p => String(p.id) === String(part_id));
+    const sel = document.getElementById('procSel');
+    sel.innerHTML = (part && part.process_list && part.process_list.length)
+      ? part.process_list.map(pr => `<option value="${pr.id}">${App.esc(pr.process_code)} · ${App.esc(pr.method_name)}</option>`).join('')
+      : '<option value="">（无工序）</option>';
+    // 触发 face 的 faces 加载
+    if (document.getElementById('faceBox')) {
+      sel.onchange = () => onScopeProcChange(sel.value);
+      onScopeProcChange(sel.value);
+    }
+  };
+
+  window.onScopeProcChange = async (process_id) => {
+    const box = document.getElementById('faceBox');
+    if (!box) return;
+    if (!process_id) { box.innerHTML = '<span class="muted">先选工序</span>'; return; }
+    // 前端不直接查 process_faces (没有专门接口)，让用户手动填
+    box.innerHTML = ['A','B','C','D','E','F'].map(f =>
+      `<label><input type="checkbox" name="face_labels" value="${f}"> ${f}</label>`
+    ).join('');
+    box.setAttribute('data-process-id', process_id);
+  };
+
+  window.doAddScope = async (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const body = {
+      scope_level: fd.get('scope_level'),
+      quantity: parseInt(fd.get('quantity')) || 1,
+      description: fd.get('description') || null,
+    };
+    ['mold_id','part_id','process_id'].forEach(k => {
+      const v = fd.get(k);
+      if (v) body[k] = parseInt(v);
+    });
+
+    // face 级要先确保 process_faces 存在，然后填 face_ids
+    if (body.scope_level === 'face') {
+      const labels = fd.getAll('face_labels');
+      if (!labels.length) { toast('❌ face 级要勾至少一个面', 'error'); return false; }
+      // 先确保 process_faces 都存在（后端 process_faces 表，让它按 label 先插再查）
+      // MVP: 先不做自动插，提示用户去后端手动建；或简单起见，直接报错说 face_ids 需要后端 process_faces 有记录
+      try {
+        // 尝试通过一个简单查询获取 face_ids
+        // 由于没有端点，用 App.api('/api/internal/process-faces?process_id=xx&labels=A,B')
+        const process_id = parseInt(fd.get('process_id'));
+        const res = await App.api(`/api/internal/processes/${process_id}/faces?labels=` + labels.join(','));
+        body.face_ids = res.ids;
+      } catch (e) {
+        toast('❌ ' + e.message, 'error');
+        return false;
+      }
+    }
+
+    try {
+      await App.api(`/api/internal/outsource-requests/${rid}/scope-items`, { method:'POST', body });
+      toast('✓ 委外项已添加');
+      closeScopeModal();
+      await loadScopeItems(true);
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+    return false;
+  };
+
+  window.delScope = async (id) => {
+    if (!confirm('删除这个委外项？')) return;
+    try {
+      await App.api(`/api/internal/scope-items/${id}`, { method:'DELETE' });
+      toast('✓ 已删除');
+      await loadScopeItems(true);
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  };
 
   window.doSend = async () => {
     if (!confirm('将群发询价给所有符合工艺的加工方，确定？')) return;

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>异常通知 - 材料方</title>
+<link rel="stylesheet" href="/static/common.css">
+<style>
+.severity-critical { background:#7f1d1d; color:#fca5a5; padding:2px 8px; border-radius:4px; font-size:11px; }
+.severity-high     { background:#7c2d12; color:#fdba74; padding:2px 8px; border-radius:4px; font-size:11px; }
+.severity-medium   { background:#78350f; color:#fcd34d; padding:2px 8px; border-radius:4px; font-size:11px; }
+.severity-low      { background:#0e7490; color:#67e8f9; padding:2px 8px; border-radius:4px; font-size:11px; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand"><a href="/static/material/home.html" style="color:inherit;">📦 材料方</a> &nbsp;›&nbsp; <span style="color:#e2e8f0;">异常通知</span></div>
+  <div class="user">
+    <span class="badge" style="background:#134e4a; color:#5eead4;">material</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <h2 style="margin-bottom:14px;">⚠️ 本厂被判责的异常</h2>
+    <p class="muted" style="margin-bottom:14px;">材料方被判定承担责任（如材质不符、批次不良等）产生的补料通知都在此处</p>
+    <table>
+      <thead><tr>
+        <th>异常号</th><th>项目</th><th>严重度</th><th>缺陷</th>
+        <th>处理路径</th><th>我方承担</th><th>补料单</th><th>发生时间</th>
+      </tr></thead>
+      <tbody id="body"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
+    </table>
+  </div>
+</main>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('material');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+
+  (async () => {
+    const r = await App.api('/api/material/my-exceptions');
+    const body = document.getElementById('body');
+    if (!r.items.length) { body.innerHTML = `<tr><td colspan="8" class="empty">✓ 没有异常通知</td></tr>`; return; }
+    body.innerHTML = r.items.map(e => {
+      const rwHtml = (e.rework_orders || []).map(rw =>
+        `<code style="font-size:10px;">${App.esc(rw.rework_no)}</code> <span class="badge ${rw.status}">${rw.status}</span>`
+      ).join('<br>') || '—';
+      return `<tr>
+        <td><code>${App.esc(e.exception_no)}</code></td>
+        <td>${App.esc(e.project_no)} · ${App.esc(e.project_name)}</td>
+        <td><span class="severity-${e.severity}">${e.severity}</span></td>
+        <td>${App.esc(e.exception_type || '—')}</td>
+        <td><span class="badge">${App.esc(e.resolution_path || '—')}</span></td>
+        <td><b style="color:#fbbf24;">${e.responsibility_ratio}%</b></td>
+        <td>${rwHtml}</td>
+        <td class="muted">${App.fmtDate(e.created_at)}</td>
+      </tr>`;
+    }).join('');
+  })();
+})();
+</script>
+</body>
+</html>

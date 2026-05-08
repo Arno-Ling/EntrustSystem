@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>材料方首页 - MVP</title>
+<link rel="stylesheet" href="/static/common.css">
+<style>
+.stats { display:flex; gap:12px; margin-bottom:14px; }
+.stat  { flex:1; background:#0f172a; border:1px solid #334155; padding:12px; border-radius:8px; text-align:center; }
+.stat b { font-size:22px; display:block; color:#60a5fa; }
+.stat span { font-size:11px; color:#94a3b8; }
+.tabs { display:flex; gap:4px; border-bottom:2px solid #334155; margin-bottom:16px; }
+.tab  { padding:10px 16px; cursor:pointer; border-bottom:2px solid transparent; margin-bottom:-2px; color:#94a3b8; font-size:14px; }
+.tab.active { border-bottom-color:#60a5fa; color:#60a5fa; font-weight:600; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">📦 材料方视角</div>
+  <div class="user">
+    <a href="/static/material/my-exceptions.html" class="secondary" style="padding:6px 12px; border-radius:4px; font-size:12px;">⚠️ 异常通知</a>
+    <span class="badge processor" style="background:#134e4a; color:#5eead4;">material</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="page-header">
+    <h1>📦 <span id="hello">欢迎</span></h1>
+    <div class="muted">材料方视角 · 接单 / 备料 / 发货</div>
+  </div>
+
+  <div class="card">
+    <h2 style="margin-bottom:12px;">🏁 我的工作</h2>
+    <div class="stats" id="stats">
+      <div class="stat"><b id="s_pending">0</b><span>待接单</span></div>
+      <div class="stat"><b id="s_accepted">0</b><span>已接单</span></div>
+      <div class="stat"><b id="s_shipped">0</b><span>已发货</span></div>
+      <div class="stat"><b id="s_received">0</b><span>已收货</span></div>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="po">📋 我的采购单</div>
+      <div class="tab" data-tab="shipments">🚚 发货历史</div>
+    </div>
+
+    <div class="panel" data-panel="po">
+      <table>
+        <thead><tr>
+          <th>单号</th><th>项目</th><th>材料</th><th>规格</th>
+          <th>数量</th><th>需求日期</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="poBody"><tr><td colspan="8" class="empty">加载中...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="panel" data-panel="shipments" style="display:none;">
+      <table>
+        <thead><tr>
+          <th>发货单号</th><th>项目</th><th>材料</th><th>发货数量</th>
+          <th>批次</th><th>承运</th><th>状态</th><th>发货时间</th>
+        </tr></thead>
+        <tbody id="shBody"><tr><td colspan="8" class="empty">—</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<!-- 发货 modal -->
+<div class="modal-bg" id="shipModal">
+  <div class="modal" style="width:640px; max-width:92vw;">
+    <h3>🚚 备料发货 · 需拍照取证</h3>
+    <p class="muted" id="shipPoInfo" style="margin-bottom:12px;"></p>
+    <form onsubmit="return submitShip(event)">
+      <div class="flex">
+        <div class="flex-grow"><label>发货数量 *</label><input name="qty_shipped" type="number" step="0.01" required></div>
+        <div class="flex-grow"><label>批次号</label><input name="batch_no"></div>
+      </div>
+      <div class="flex">
+        <div class="flex-grow"><label>承运商</label><input name="carrier"></div>
+        <div class="flex-grow"><label>运单号</label><input name="tracking_no"></div>
+      </div>
+
+      <!-- 拍照取证 -->
+      <label>📸 发货物料/包装照片 *<span class="muted" style="margin-left:6px;">（至少 1 张，建议含包装 + 铭牌 + 整体多角度）</span></label>
+      <input type="file" id="shipPhotoInput" accept="image/*" multiple onchange="onShipPhotosSelected(event)">
+      <div id="shipPhotoPreview" style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;"></div>
+
+      <label>备注</label>
+      <input name="remark" placeholder="备齐情况 / 特殊说明">
+
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeShip()">取消</button>
+        <button type="submit" class="primary" id="btnShipSubmit">确认发货</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="toast" id="toast" style="position:fixed; bottom:30px; right:30px; padding:10px 20px; border-radius:5px; display:none; z-index:200;"></div>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('material');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+  const helloEl = document.getElementById('hello');
+  if (helloEl) helloEl.textContent = `你好，${user.display_name || user.username}`;
+
+  function showToast(msg, err=false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg;
+    t.style.display = 'block';
+    t.style.background = err ? '#7f1d1d' : '#065f46';
+    t.style.color = err ? '#fca5a5' : '#6ee7b7';
+    setTimeout(() => t.style.display = 'none', 2500);
+  }
+
+  // tabs
+  document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    document.querySelectorAll('.panel').forEach(p => p.style.display = (p.dataset.panel === t.dataset.tab ? '' : 'none'));
+    if (t.dataset.tab === 'shipments') loadShipments();
+  }));
+
+  async function loadPOs() {
+    const r = await App.api('/api/material/pos');
+    document.getElementById('s_pending').textContent = r.stats.pending_accept;
+    document.getElementById('s_accepted').textContent = r.stats.accepted;
+    document.getElementById('s_shipped').textContent = r.stats.shipped;
+    document.getElementById('s_received').textContent = r.stats.received;
+
+    const statusMap = {
+      drafted:'待接单', sent:'待接单', accepted:'已接单',
+      shipped:'已发货', received:'已收货', cancelled:'已取消',
+    };
+    const body = document.getElementById('poBody');
+    if (!r.items.length) {
+      body.innerHTML = `<tr><td colspan="8" class="empty">暂无采购单</td></tr>`; return;
+    }
+    body.innerHTML = r.items.map(po => {
+      let action = '';
+      if (po.status === 'sent' || po.status === 'drafted') {
+        action = `<button class="primary" onclick="doAccept(${po.id})">接单</button>`;
+      } else if (po.status === 'accepted') {
+        action = `<button class="primary" onclick="openShip(${po.id}, '${App.esc(po.po_no)}', ${po.qty})">备料发货</button>`;
+      } else {
+        action = `<span class="muted">—</span>`;
+      }
+      const surplus = po.moq_surplus_qty > 0
+        ? `<br><span style="font-size:10px; color:#f59e0b;">⚠ MOQ +${po.moq_surplus_qty}</span>`
+        : '';
+      return `<tr>
+        <td><code>${App.esc(po.po_no)}</code></td>
+        <td>${App.esc(po.project_no)} · ${App.esc(po.project_name)}</td>
+        <td><b>${App.esc(po.material_code)}</b></td>
+        <td>${App.esc(po.spec || '—')}</td>
+        <td>${po.qty}${po.unit}${surplus}</td>
+        <td>${App.esc(po.required_date || '—')}</td>
+        <td><span class="badge ${po.status}">${statusMap[po.status] || po.status}</span></td>
+        <td>${action}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function loadShipments() {
+    const r = await App.api('/api/material/shipments');
+    const body = document.getElementById('shBody');
+    if (!r.items.length) { body.innerHTML = `<tr><td colspan="8" class="empty">暂无发货记录</td></tr>`; return; }
+    body.innerHTML = r.items.map(s => `<tr>
+      <td><code>${App.esc(s.shipment_no)}</code></td>
+      <td>${App.esc(s.project_no)} · ${App.esc(s.project_name)}</td>
+      <td>${App.esc(s.material_code)}</td>
+      <td>${s.qty_shipped}</td>
+      <td>${App.esc(s.batch_no || '—')}</td>
+      <td>${App.esc(s.carrier || '—')}</td>
+      <td><span class="badge ${s.status}">${s.status}</span></td>
+      <td class="muted">${App.fmtDate(s.shipped_at)}</td>
+    </tr>`).join('');
+  }
+
+  window.doAccept = async (po_id) => {
+    if (!confirm('接下这个订单？')) return;
+    try {
+      await App.api(`/api/material/pos/${po_id}/accept`, { method:'POST' });
+      showToast('✓ 已接单');
+      loadPOs();
+    } catch (e) { showToast('❌ ' + e.message, true); }
+  };
+
+  let _currentPoId = null;
+  let _shipPhotos = [];   // 已上传成功的照片 path 数组
+  window.openShip = (po_id, po_no, qty) => {
+    _currentPoId = po_id;
+    _shipPhotos = [];
+    document.getElementById('shipPoInfo').textContent = `订单 ${po_no}，需发货 ${qty}`;
+    const form = document.querySelector('#shipModal form');
+    form.reset();
+    form.elements['qty_shipped'].value = qty;
+    document.getElementById('shipPhotoPreview').innerHTML = '';
+    document.getElementById('shipModal').classList.add('show');
+  };
+  window.closeShip = () => {
+    document.getElementById('shipModal').classList.remove('show');
+    _currentPoId = null; _shipPhotos = [];
+  };
+
+  window.onShipPhotosSelected = async (ev) => {
+    const files = ev.target.files;
+    if (!files.length) return;
+    const btn = document.getElementById('btnShipSubmit');
+    btn.disabled = true;
+    for (const file of files) {
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const r = await App.api(`/api/material/pos/${_currentPoId}/photos`,
+                                { method:'POST', body: fd });
+        _shipPhotos.push(r.path);
+        renderShipPreview();
+      } catch (e) { showToast('❌ 上传失败：' + e.message, true); }
+    }
+    ev.target.value = '';
+    btn.disabled = false;
+  };
+
+  function renderShipPreview() {
+    const box = document.getElementById('shipPhotoPreview');
+    box.innerHTML = _shipPhotos.map((p, i) => `
+      <div style="position:relative;">
+        <img src="/uploads/${App.esc(p)}" style="width:80px; height:80px; object-fit:cover; border-radius:6px; border:1px solid #334155;">
+        <button type="button" onclick="removeShipPhoto(${i})"
+                style="position:absolute; top:-6px; right:-6px; width:20px; height:20px; padding:0; border-radius:50%; background:#7f1d1d; color:#fca5a5; border:none; cursor:pointer; font-size:10px;">×</button>
+      </div>
+    `).join('');
+  }
+  window.removeShipPhoto = (idx) => { _shipPhotos.splice(idx, 1); renderShipPreview(); };
+
+  window.submitShip = async (ev) => {
+    ev.preventDefault();
+    if (_shipPhotos.length === 0) {
+      showToast('❌ 请至少上传 1 张发货照片', true);
+      return false;
+    }
+    const fd = new FormData(ev.target);
+    const body = { photo_paths: _shipPhotos };
+    fd.forEach((v, k) => { if (v === '') return; body[k] = k === 'qty_shipped' ? parseFloat(v) : v; });
+    try {
+      await App.api(`/api/material/pos/${_currentPoId}/ship`, { method:'POST', body });
+      showToast('✓ 已发货');
+      closeShip();
+      loadPOs();
+    } catch (e) { showToast('❌ ' + e.message, true); }
+    return false;
+  };
+
+  loadPOs();
+})();
+</script>
+</body>
+</html>
