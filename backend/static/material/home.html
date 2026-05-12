@@ -43,7 +43,17 @@
 
     <div class="tabs">
       <div class="tab active" data-tab="po">📋 我的采购单</div>
+      <div class="tab" data-tab="inquiries">📨 材料询价</div>
       <div class="tab" data-tab="shipments">🚚 发货历史</div>
+    </div>
+
+    <div class="panel" data-panel="inquiries" style="display:none;">
+      <table>
+        <thead><tr>
+          <th>询价单号</th><th>标题</th><th>项目</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="inqBody"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody>
+      </table>
     </div>
 
     <div class="panel" data-panel="po">
@@ -123,6 +133,7 @@
     t.classList.add('active');
     document.querySelectorAll('.panel').forEach(p => p.style.display = (p.dataset.panel === t.dataset.tab ? '' : 'none'));
     if (t.dataset.tab === 'shipments') loadShipments();
+    if (t.dataset.tab === 'inquiries') loadInquiries();
   }));
 
   async function loadPOs() {
@@ -255,6 +266,27 @@
     } catch (e) { showToast('❌ ' + e.message, true); }
     return false;
   };
+
+  async function loadInquiries() {
+    try {
+      const r = await App.api('/api/material/inquiries');
+      const body = document.getElementById('inqBody');
+      const SM = { sent:'待报价', quoted:'已报价', no_response:'已过期', cancelled:'已取消' };
+      if (!r.items.length) {
+        body.innerHTML = '<tr><td colspan="5" class="empty">暂无材料询价</td></tr>';
+        return;
+      }
+      body.innerHTML = r.items.map(i => `
+        <tr>
+          <td><code>${App.esc(i.inquiry_no)}</code></td>
+          <td>${App.esc(i.title || '—')}</td>
+          <td>${App.esc(i.project_no)} · ${App.esc(i.project_name || '')}</td>
+          <td><span class="badge ${i.invitation_status}">${SM[i.invitation_status] || i.invitation_status}</span></td>
+          <td><a href="/static/material/inquiry-detail.html?id=${i.invitation_id}">查看/报价</a></td>
+        </tr>
+      `).join('');
+    } catch (e) { showToast('❌ ' + e.message, true); }
+  }
 
   loadPOs();
 })();

@@ -119,6 +119,10 @@
         <div style="margin-top:6px;"><b>所需工艺</b>:
           ${(inv.required_processes || []).map(p => '<span class="badge drafted" style="margin-right:4px;">'+App.esc(p)+'</span>').join('')}
         </div>
+        ${inv.material_sourcing === 'internal' ?
+          '<div style="margin-top:10px; padding:10px; background:#064e3b; border:1px solid #10b981; border-radius:6px; color:#6ee7b7;">📦 材料由我方统一供应，无需报材料费</div>' :
+          inv.material_sourcing === 'processor' ?
+          '<div style="margin-top:10px; padding:10px; background:#78350f; border:1px solid #f59e0b; border-radius:6px; color:#fbbf24;">🛒 材料由贵方自行采购，请在报价中包含材料成本</div>' : ''}
         <div class="muted" style="margin-top:8px;">邀请状态: <span class="badge ${inv.invitation_status}">${App.esc(inv.invitation_status)}</span></div>
       `;
 
@@ -158,6 +162,8 @@
       const btn = document.getElementById('btnSubmit');
       const scope = data.scope_items || [];
       const myLines = data.my_quote_lines || [];
+      const materialSourcing = inv.material_sourcing || null;
+      window._materialSourcing = materialSourcing;
 
       if (scope.length > 0) {
         // 矩阵模式
@@ -166,6 +172,8 @@
         document.getElementById('lineCount').textContent = scope.length;
         const byItem = {};
         myLines.forEach(l => byItem[l.scope_item_id] = l);
+
+        const showMatCol = materialSourcing === 'processor';
 
         document.getElementById('lineBody').innerHTML = scope.map((it, idx) => {
           const existing = byItem[it.scope_item_id];
@@ -177,12 +185,27 @@
             <td>${it.quantity}</td>
             <td><input type="number" step="0.01" min="0.01" data-sid="${it.scope_item_id}" class="line-price"
                        value="${existing ? existing.unit_price : ''}"></td>
+            ${showMatCol ? `<td><input type="number" step="0.01" min="0.01" data-sid="${it.scope_item_id}" class="line-mat-price"
+                       value="${existing && existing.material_unit_price ? existing.material_unit_price : ''}" placeholder="材料单价"></td>` : ''}
             <td><input type="number" min="1" data-sid="${it.scope_item_id}" class="line-lead"
                        value="${existing ? existing.lead_time_days : ''}"></td>
             <td><input data-sid="${it.scope_item_id}" class="line-note"
                        value="${existing ? App.esc(existing.note || '') : ''}"></td>
           </tr>`;
         }).join('');
+
+        // 动态添加表头列
+        if (showMatCol) {
+          const thead = document.querySelector('#lineMode thead tr');
+          if (thead && !thead.querySelector('.mat-price-th')) {
+            const thPrice = thead.querySelectorAll('th')[4]; // 单价列后面
+            const newTh = document.createElement('th');
+            newTh.className = 'mat-price-th';
+            newTh.style.width = '120px';
+            newTh.textContent = '材料单价（元）';
+            thPrice.after(newTh);
+          }
+        }
 
         if (data.my_quote) {
           document.getElementById('quoteTitle').textContent = '✏️ 修改逐项报价';
@@ -213,10 +236,12 @@
   window.submitLines = async () => {
     const rows = document.querySelectorAll('#lineBody tr');
     const lines = [];
+    const isProcessorMode = window._materialSourcing === 'processor';
     for (const r of rows) {
       const priceEl = r.querySelector('.line-price');
       const leadEl  = r.querySelector('.line-lead');
       const noteEl  = r.querySelector('.line-note');
+      const matPriceEl = r.querySelector('.line-mat-price');
       const sid = parseInt(priceEl.dataset.sid);
       const price = parseFloat(priceEl.value);
       const lead = parseInt(leadEl.value);
@@ -224,7 +249,16 @@
         toast('❌ 每行都必须填单价和交期', 'error');
         return;
       }
-      lines.push({ scope_item_id: sid, unit_price: price, lead_time_days: lead, note: noteEl.value.trim() || null });
+      const lineObj = { scope_item_id: sid, unit_price: price, lead_time_days: lead, note: noteEl.value.trim() || null };
+      if (isProcessorMode && matPriceEl) {
+        const matPrice = parseFloat(matPriceEl.value);
+        if (!(matPrice > 0)) {
+          toast('❌ 加工方自采模式下每行都必须填材料单价', 'error');
+          return;
+        }
+        lineObj.material_unit_price = matPrice;
+      }
+      lines.push(lineObj);
     }
     try {
       const r = await App.api(`/api/processor/invitations/${id}/quote`, {

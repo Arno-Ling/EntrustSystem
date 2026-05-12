@@ -40,6 +40,8 @@ from mvp.routes.inquiry import (
     material_router  as inquiry_material_router,
     processor_router as inquiry_processor_router,
 )
+from mvp.routes.materials import router as materials_router
+from mvp.routes.drawings import router as drawings_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -89,6 +91,8 @@ app.include_router(inquiry_internal_router)
 app.include_router(inquiry_material_router)
 app.include_router(inquiry_processor_router)
 app.include_router(common_router)
+app.include_router(materials_router)
+app.include_router(drawings_router)
 
 
 @app.get("/", include_in_schema=False)

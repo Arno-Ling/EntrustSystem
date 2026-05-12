@@ -56,8 +56,10 @@ class PartCreate(BaseModel):
     part_no: Optional[str] = None                   # 可省略，由后端根据 part_type + sort_no 生成 die-02 这种
     part_name: Optional[str] = None
     material: Optional[str] = None
+    material_id: Optional[int] = None               # FK to materials 表（单选）
     qty: int = Field(default=1, ge=1)
     processes: list[str] = Field(default_factory=list)
+    process_method_ids: Optional[list[int]] = None  # FK list to process_methods（多选）
     spec: Optional[str] = None
     mold_id: Optional[int] = None                   # 归属模具套
     part_type: Optional[str] = None                 # die / ins / part / frame / std
@@ -266,11 +268,25 @@ async def get_project(
         (project_id,),
     )
 
+    # 图纸库关联
+    drawing_links = db.fetch_all(
+        """
+        SELECT pdl.id AS link_id, pdl.drawing_id, pdl.linked_at,
+               dl.name, dl.file_name, dl.category, dl.file_size, dl.mime_type
+        FROM project_drawing_links pdl
+        JOIN drawing_library dl ON pdl.drawing_id = dl.id
+        WHERE pdl.project_id = %s
+        ORDER BY pdl.linked_at DESC
+        """,
+        (project_id,),
+    )
+
     return {
         "project": project,
         "molds": molds,
         "parts": parts,
         "attachments": attachments,
+        "drawing_links": drawing_links,
     }
 
 
@@ -357,17 +373,30 @@ async def add_part(
             sort_no = (row["mx"] or 0) + 1
         part_no = f"{part_type}-{sort_no:02d}"
 
+    # 材质处理：material_id 优先于 material 文本
+    material_text = payload.material
+    material_id_val = payload.material_id
+    if material_id_val is not None:
+        mat_row = db.fetch_one(
+            "SELECT id, code FROM materials WHERE id = %s",
+            (material_id_val,),
+        )
+        if mat_row is None:
+            raise HTTPException(status_code=400,
+                                detail=f"material_id 不存在: {material_id_val}")
+        material_text = mat_row["code"]  # 自动填充 material 文本列
+
     try:
         new_id = db.execute(
             """
             INSERT INTO project_parts (project_id, mold_id, part_type, sort_no,
-                                       part_no, part_name, material,
+                                       part_no, part_name, material, material_id,
                                        qty, processes_json, spec)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
             """,
             (project_id, mold_id, part_type, sort_no,
-             part_no, payload.part_name, payload.material,
+             part_no, payload.part_name, material_text, material_id_val,
              payload.qty, json.dumps(payload.processes, ensure_ascii=False),
              payload.spec),
         )
@@ -375,6 +404,41 @@ async def add_part(
         if "part_no" in str(e):
             raise HTTPException(status_code=409, detail=f"零件号冲突：{part_no}")
         raise
+
+    # 工序处理：process_method_ids 优先于 processes 文本
+    if payload.process_method_ids:
+        # 校验所有 ID 存在
+        placeholders = ",".join(["%s"] * len(payload.process_method_ids))
+        existing = db.fetch_all(
+            f"SELECT name FROM process_methods WHERE id IN ({placeholders})",
+            tuple(payload.process_method_ids),
+        )
+        if len(existing) != len(payload.process_method_ids):
+            existing_names = {r["name"] for r in existing}
+            # 需要用 id 查找无效的
+            all_methods = db.fetch_all("SELECT id, name FROM process_methods")
+            valid_ids = {r["id"] for r in all_methods}
+            invalid = [mid for mid in payload.process_method_ids if mid not in valid_ids]
+            raise HTTPException(status_code=400,
+                                detail=f"无效的工序ID: {invalid}")
+
+        # 创建 project_processes 记录
+        method_map = {r["id"]: r["name"] for r in db.fetch_all("SELECT id, name FROM process_methods")}
+        with db.get_conn() as conn:
+            with conn.cursor() as cur:
+                for seq, mid in enumerate(payload.process_method_ids, start=1):
+                    method_name = method_map.get(mid, "")
+                    process_code = f"P{seq}-{method_name}"
+                    cur.execute(
+                        """
+                        INSERT INTO project_processes
+                            (project_id, part_id, seq_no, process_code, method_name)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        (project_id, new_id, seq, process_code, method_name),
+                    )
+
     return {"id": new_id, "part_no": part_no, "sort_no": sort_no, "mold_id": mold_id}
 
 
@@ -516,7 +580,7 @@ async def list_process_methods(user: CurrentUser = Depends(_require_internal)):
     """加工方式字典（供前端下拉用）。"""
     rows = db.fetch_all(
         """
-        SELECT name, category, is_internal_capable, remark
+        SELECT id, name, category, is_internal_capable, remark
         FROM process_methods
         ORDER BY category, name
         """
@@ -1539,7 +1603,18 @@ async def act_approval(
                             for idx, drow in enumerate(dec_rows, start=1):
                                 d_id, part_id, process_id, proc_name, \
                                     scope_level, face_ids, mold_id, part_qty = drow
+                                # 根据实际数据确定合法的 scope_level，
+                                # 满足 ck_scope_required 约束
                                 level = scope_level or ('face' if face_ids else 'method')
+                                # 降级逻辑：数据不满足高级别约束时自动降级
+                                if level == 'face' and (not face_ids):
+                                    level = 'method'
+                                if level == 'method' and (process_id is None):
+                                    level = 'part'
+                                if level == 'part' and (part_id is None):
+                                    level = 'mold' if mold_id else 'project'
+                                if level == 'mold' and (mold_id is None):
+                                    level = 'project'
                                 desc = f"决策行 #{d_id}: {proc_name}" + (
                                     f" (面: {face_ids})" if face_ids else ""
                                 )
@@ -1588,6 +1663,7 @@ class OutsourceRequestUpdate(BaseModel):
     title: Optional[str] = None
     deadline: Optional[str] = None
     quantity: Optional[int] = None
+    material_sourcing: Optional[str] = Field(None, pattern="^(internal|processor)$")
 
 
 class AwardAction(BaseModel):
@@ -1965,19 +2041,25 @@ async def broadcast_invitations(
     req_id: int,
     user: CurrentUser = Depends(_require_internal),
 ):
-    """群发给所有符合工艺的候选加工方。"""
+    """群发给所有符合工艺的候选加工方。
+    若 material_sourcing='internal'，同时创建材料询价单并群发给材料方。
+    """
     # Reuse candidate logic
     cand = await list_candidates(req_id, user)
     if not cand["items"]:
         raise HTTPException(status_code=400, detail="没有符合工艺要求的候选加工方")
 
     req = db.fetch_one(
-        "SELECT status FROM outsource_requests WHERE id = %s",
+        "SELECT id, status, material_sourcing, project_id FROM outsource_requests WHERE id = %s",
         (req_id,),
     )
     if req["status"] not in ("draft",):
         raise HTTPException(status_code=409,
                             detail=f"只有 draft 状态可以群发；当前 '{req['status']}'")
+
+    # 校验 material_sourcing 已选择
+    if not req["material_sourcing"]:
+        raise HTTPException(status_code=400, detail="请先选择材料供应方式")
 
     # 查 tenant 对应 supplier
     tenants_map = {
@@ -1990,8 +2072,13 @@ async def broadcast_invitations(
 
     now = datetime.utcnow()
     inserted = 0
+    material_inquiry_id = None
+    material_inquiry_no = None
+    invited_material_count = 0
+
     with db.get_conn() as conn:
         with conn.cursor() as cur:
+            # --- 加工方邀请（不变） ---
             for c in cand["items"]:
                 if c["already_invited"]:
                     continue
@@ -2005,17 +2092,102 @@ async def broadcast_invitations(
                 )
                 inserted += 1
 
+            # --- 材料询价（仅 internal 模式） ---
+            if req["material_sourcing"] == "internal":
+                project_id = req["project_id"]
+
+                # 从 project_parts 提取去重的 (material, spec) + 汇总数量
+                cur.execute(
+                    """
+                    SELECT material, spec, SUM(qty) AS total_qty
+                    FROM project_parts
+                    WHERE project_id = %s AND material IS NOT NULL AND material != ''
+                    GROUP BY material, spec
+                    ORDER BY material, spec
+                    """,
+                    (project_id,),
+                )
+                bom_rows = cur.fetchall()
+                if not bom_rows:
+                    raise HTTPException(status_code=400,
+                                        detail="项目零件清单中没有材料信息，无法创建材料询价")
+
+                # 生成询价单号
+                cur.execute("SELECT project_no FROM projects WHERE id=%s", (project_id,))
+                proj_row = cur.fetchone()
+                pn = proj_row[0] if proj_row else f"P{project_id}"
+                material_inquiry_no = f"MI-{pn}-{uuid.uuid4().hex[:4].upper()}"
+
+                # 创建 material_inquiries
+                title = f"{pn} 材料询价"
+                cur.execute(
+                    """
+                    INSERT INTO material_inquiries
+                        (inquiry_no, outsource_request_id, outsource_order_id, project_id,
+                         title, material_code, status, created_by)
+                    VALUES (%s, %s, NULL, %s, %s, %s, 'inviting', %s)
+                    RETURNING id
+                    """,
+                    (material_inquiry_no, req_id, project_id, title,
+                     bom_rows[0][0],  # material_code 取第一行（兼容旧字段）
+                     user.user_id),
+                )
+                material_inquiry_id = cur.fetchone()[0]
+
+                # 创建 material_inquiry_lines
+                for idx, (mat_code, spec, total_qty) in enumerate(bom_rows, start=1):
+                    cur.execute(
+                        """
+                        INSERT INTO material_inquiry_lines
+                            (inquiry_id, material_code, material_name, spec, qty, unit, sort_order)
+                        VALUES (%s, %s, NULL, %s, %s, 'kg', %s)
+                        """,
+                        (material_inquiry_id, mat_code, spec, total_qty, idx),
+                    )
+
+                # 群发给所有材料方租户
+                cur.execute(
+                    """
+                    SELECT t.id AS tenant_id, t.supplier_id
+                    FROM tenants t
+                    WHERE t.tenant_type='material' AND t.supplier_id IS NOT NULL
+                    """
+                )
+                mat_tenants = cur.fetchall()
+                for mt in mat_tenants:
+                    t_id, s_id = mt
+                    cur.execute(
+                        """
+                        INSERT INTO material_inquiry_invitations
+                            (inquiry_id, supplier_id, tenant_id, invitation_status, sent_at)
+                        VALUES (%s, %s, %s, 'sent', %s)
+                        ON CONFLICT (inquiry_id, supplier_id) DO NOTHING
+                        """,
+                        (material_inquiry_id, s_id, t_id, now),
+                    )
+                    if cur.rowcount:
+                        invited_material_count += 1
+
             cur.execute(
                 "UPDATE outsource_requests SET status = 'inviting' WHERE id = %s",
                 (req_id,),
             )
 
-    return {
-        "invited_count": inserted,
+    result = {
+        "invited_processor_count": inserted,
         "total_candidates": len(cand["items"]),
         "status": "inviting",
-        "note": f"群发给 {inserted} 家能匹配工艺的加工方",
+        "material_sourcing": req["material_sourcing"],
     }
+    if req["material_sourcing"] == "internal":
+        result["material_inquiry_id"] = material_inquiry_id
+        result["material_inquiry_no"] = material_inquiry_no
+        result["invited_material_supplier_count"] = invited_material_count
+    else:
+        result["material_inquiry_id"] = None
+        result["invited_material_supplier_count"] = None
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2412,6 +2584,42 @@ async def award_outsource(
                     "UPDATE outsource_requests SET status='cancelled' WHERE id=%s",
                     (request_id,),
                 )
+
+            # 5. 材料供应方式传播 + 材料询价关联
+            if action_value == "approve" and order_ids:
+                # 从 outsource_requests 获取 material_sourcing
+                cur.execute(
+                    "SELECT material_sourcing FROM outsource_requests WHERE id=%s",
+                    (request_id,),
+                )
+                ms_row = cur.fetchone()
+                ms_value = ms_row[0] if ms_row else None
+
+                if ms_value:
+                    # 设置所有新建 order 的 material_sourcing
+                    for oid in order_ids:
+                        cur.execute(
+                            """
+                            UPDATE outsource_orders
+                            SET material_sourcing = %s,
+                                material_sourcing_decided_by = %s,
+                                material_sourcing_decided_at = %s
+                            WHERE id = %s
+                            """,
+                            (ms_value, user.user_id, now, oid),
+                        )
+
+                # 把预创建的 material_inquiries 关联到第一张 order
+                # （一个 request 通常只有一张材料询价单）
+                if order_ids:
+                    cur.execute(
+                        """
+                        UPDATE material_inquiries
+                        SET outsource_order_id = %s
+                        WHERE outsource_request_id = %s AND outsource_order_id IS NULL
+                        """,
+                        (order_ids[0], request_id),
+                    )
 
     return {
         "status": "ok",

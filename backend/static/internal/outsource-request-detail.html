@@ -177,6 +177,25 @@
           <b>所需工艺</b>:
           ${(r.required_processes || []).map(p => '<span class="badge drafted" style="margin-right:4px;">'+App.esc(p)+'</span>').join('')}
         </div>
+        <div style="margin-top:10px; padding:10px; background:#1e293b; border-radius:6px;">
+          <b>📦 材料供应方式</b>：
+          ${r.status === 'draft' ? `
+            <label style="margin-left:12px; cursor:pointer;">
+              <input type="radio" name="material_sourcing" value="internal"
+                     ${r.material_sourcing === 'internal' ? 'checked' : ''}
+                     onchange="saveSourcing('internal')"> 我方统一供料
+            </label>
+            <label style="margin-left:16px; cursor:pointer;">
+              <input type="radio" name="material_sourcing" value="processor"
+                     ${r.material_sourcing === 'processor' ? 'checked' : ''}
+                     onchange="saveSourcing('processor')"> 加工方自采
+            </label>
+          ` : `
+            <span class="badge ${r.material_sourcing || 'drafted'}" style="margin-left:8px;">
+              ${r.material_sourcing === 'internal' ? '我方统一供料' : r.material_sourcing === 'processor' ? '加工方自采' : '未设置'}
+            </span>
+          `}
+        </div>
       `;
 
       // Stats
@@ -395,11 +414,33 @@
   };
 
   window.doSend = async () => {
-    if (!confirm('将群发询价给所有符合工艺的加工方，确定？')) return;
+    // 校验材料供应方式已选择
+    const sourcingRadio = document.querySelector('input[name="material_sourcing"]:checked');
+    if (!sourcingRadio) {
+      toast('❌ 请先选择材料供应方式', 'error');
+      return;
+    }
+    const mode = sourcingRadio.value;
+    const modeText = mode === 'internal' ? '（同时发材料询价给材料方）' : '（加工方自采材料）';
+    if (!confirm(`将群发询价给所有符合工艺的加工方${modeText}，确定？`)) return;
     try {
       const r = await App.api(`/api/internal/outsource-requests/${rid}/send`, { method: 'POST' });
-      toast(`✓ 已发送给 ${r.invited_count} 家加工方`);
+      let msg = `✓ 已发送给 ${r.invited_processor_count} 家加工方`;
+      if (r.material_inquiry_id) {
+        msg += `，材料询价 ${r.material_inquiry_no} 已发给 ${r.invited_material_supplier_count} 家材料方`;
+      }
+      toast(msg);
       load();
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  };
+
+  window.saveSourcing = async (value) => {
+    try {
+      await App.api(`/api/internal/outsource-requests/${rid}`, {
+        method: 'PATCH',
+        body: { material_sourcing: value },
+      });
+      toast(`✓ 材料供应方式已设为: ${value === 'internal' ? '我方统一供料' : '加工方自采'}`);
     } catch (e) { toast('❌ ' + e.message, 'error'); }
   };
 

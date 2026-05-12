@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>图纸存储库 - MVP</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <a href="/static/internal/home.html" style="color:inherit;">🏢 模具委外采购系统</a>
+    &nbsp;›&nbsp; <span style="color:#e2e8f0;">图纸存储库</span>
+  </div>
+  <div class="user">
+    <span class="badge">internal</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+      <h2 style="margin:0; border:none; padding:0;">📐 图纸库</h2>
+      <div>
+        <select id="catFilter" onchange="load()" style="width:120px; display:inline-block; margin-right:8px;">
+          <option value="">全部分类</option>
+          <option value="mold">模具图</option>
+          <option value="part">零件图</option>
+          <option value="assembly">装配图</option>
+          <option value="other">其他</option>
+        </select>
+        <input id="keyword" placeholder="搜索名称..." style="width:140px; display:inline-block; margin-right:8px;" onkeyup="if(event.key==='Enter')load()">
+        <button class="primary" onclick="openUpload()">+ 上传图纸</button>
+      </div>
+    </div>
+    <table>
+      <thead><tr>
+        <th>名称</th><th>文件</th><th>分类</th><th>标签</th><th>大小</th><th>上传时间</th><th>操作</th>
+      </tr></thead>
+      <tbody id="tbody"><tr><td colspan="7" class="empty">加载中...</td></tr></tbody>
+    </table>
+  </div>
+</main>
+
+<!-- Upload Modal -->
+<div class="modal-bg" id="uploadModal">
+  <div class="modal">
+    <h3>上传图纸</h3>
+    <form id="uploadForm" onsubmit="return doUpload(event)">
+      <label>文件 *</label>
+      <input type="file" id="f_file" required accept=".pdf,.dwg,.dxf,.step,.stp,.igs,.png,.jpg,.jpeg">
+      <div class="flex">
+        <div class="flex-grow"><label>名称 *</label><input id="f_name" required placeholder="图纸名称"></div>
+        <div class="flex-grow">
+          <label>分类</label>
+          <select id="f_category">
+            <option value="">未分类</option>
+            <option value="mold">模具图</option>
+            <option value="part">零件图</option>
+            <option value="assembly">装配图</option>
+            <option value="other">其他</option>
+          </select>
+        </div>
+      </div>
+      <label>描述</label>
+      <textarea id="f_desc" rows="2" placeholder="可选"></textarea>
+      <label>标签（逗号分隔）</label>
+      <input id="f_tags" placeholder="热处理,线割">
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeUpload()">取消</button>
+        <button type="submit" class="primary">上传</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- Edit Modal -->
+<div class="modal-bg" id="editModal">
+  <div class="modal">
+    <h3>编辑图纸信息</h3>
+    <form onsubmit="return doEdit(event)">
+      <input type="hidden" id="e_id">
+      <div class="flex">
+        <div class="flex-grow"><label>名称</label><input id="e_name"></div>
+        <div class="flex-grow">
+          <label>分类</label>
+          <select id="e_category">
+            <option value="">未分类</option>
+            <option value="mold">模具图</option>
+            <option value="part">零件图</option>
+            <option value="assembly">装配图</option>
+            <option value="other">其他</option>
+          </select>
+        </div>
+      </div>
+      <label>描述</label>
+      <textarea id="e_desc" rows="2"></textarea>
+      <label>标签（逗号分隔）</label>
+      <input id="e_tags">
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeEdit()">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('internal');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+
+  function toast(msg, err=false) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast show ' + (err?'error':'success');
+    setTimeout(() => t.className = 'toast', 2500);
+  }
+
+  function fmtSize(bytes) {
+    if (!bytes) return '—';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+    return (bytes/1024/1024).toFixed(1) + ' MB';
+  }
+
+  window.load = async () => {
+    const cat = document.getElementById('catFilter').value;
+    const kw = document.getElementById('keyword').value.trim();
+    let url = '/api/internal/drawing-library?';
+    if (cat) url += `category=${cat}&`;
+    if (kw) url += `keyword=${encodeURIComponent(kw)}&`;
+    const r = await App.api(url);
+    const body = document.getElementById('tbody');
+    if (!r.items.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty">暂无图纸</td></tr>';
+      return;
+    }
+    body.innerHTML = r.items.map(d => `
+      <tr>
+        <td><b>${App.esc(d.name)}</b></td>
+        <td><code>${App.esc(d.file_name)}</code></td>
+        <td>${App.esc(d.category || '—')}</td>
+        <td>${(d.tags||[]).map(t=>'<span class="badge drafted" style="margin-right:3px;">'+App.esc(t)+'</span>').join('')||'—'}</td>
+        <td class="muted">${fmtSize(d.file_size)}</td>
+        <td class="muted">${App.fmtDate(d.created_at)}</td>
+        <td class="row-actions">
+          <a href="/api/internal/drawing-library/${d.id}/download" target="_blank">下载</a>
+          <button class="secondary" onclick="openEditModal(${d.id},'${App.esc(d.name)}','${d.category||''}','${App.esc(d.description||'')}','${(d.tags||[]).join(',')}')">编辑</button>
+          <button class="secondary" style="color:#f87171;" onclick="del(${d.id},'${App.esc(d.name)}')">删除</button>
+        </td>
+      </tr>
+    `).join('');
+  };
+
+  window.openUpload = () => {
+    document.getElementById('uploadForm').reset();
+    document.getElementById('uploadModal').classList.add('show');
+  };
+  window.closeUpload = () => document.getElementById('uploadModal').classList.remove('show');
+
+  window.doUpload = async (ev) => {
+    ev.preventDefault();
+    const file = document.getElementById('f_file').files[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('name', document.getElementById('f_name').value.trim());
+    fd.append('description', document.getElementById('f_desc').value.trim());
+    fd.append('category', document.getElementById('f_category').value);
+    fd.append('tags', document.getElementById('f_tags').value.trim());
+    try {
+      const r = await App.api('/api/internal/drawing-library', { method:'POST', body:fd });
+      toast(`✓ 已上传: ${r.name}`);
+      closeUpload();
+      load();
+    } catch (e) { toast('❌ ' + e.message, true); }
+    return false;
+  };
+
+  window.openEditModal = (id, name, cat, desc, tags) => {
+    document.getElementById('e_id').value = id;
+    document.getElementById('e_name').value = name;
+    document.getElementById('e_category').value = cat;
+    document.getElementById('e_desc').value = desc;
+    document.getElementById('e_tags').value = tags;
+    document.getElementById('editModal').classList.add('show');
+  };
+  window.closeEdit = () => document.getElementById('editModal').classList.remove('show');
+
+  window.doEdit = async (ev) => {
+    ev.preventDefault();
+    const id = document.getElementById('e_id').value;
+    const body = {
+      name: document.getElementById('e_name').value.trim() || null,
+      description: document.getElementById('e_desc').value.trim() || null,
+      category: document.getElementById('e_category').value || null,
+      tags: document.getElementById('e_tags').value.trim() ? document.getElementById('e_tags').value.split(',').map(s=>s.trim()) : [],
+    };
+    try {
+      await App.api(`/api/internal/drawing-library/${id}`, { method:'PATCH', body });
+      toast('✓ 已更新');
+      closeEdit();
+      load();
+    } catch (e) { toast('❌ ' + e.message, true); }
+    return false;
+  };
+
+  window.del = async (id, name) => {
+    if (!confirm(`确定删除图纸 "${name}"？`)) return;
+    try {
+      await App.api(`/api/internal/drawing-library/${id}`, { method:'DELETE' });
+      toast('✓ 已删除');
+      load();
+    } catch (e) { toast('❌ ' + e.message, true); }
+  };
+
+  load();
+})();
+</script>
+</body>
+</html>

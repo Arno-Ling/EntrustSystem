@@ -102,29 +102,54 @@
     </table>
   </div>
 
-  <!-- 图纸 -->
+  <!-- 图纸（合并：手动上传 + 图纸库关联） -->
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
-      <h2 style="margin:0;">📐 图纸 & 附件</h2>
-      <label id="btnUpload" style="display:none;">
-        <input type="file" id="fileInput" style="display:none;" onchange="doUpload(event)">
-        <span class="primary" style="display:inline-block; padding:8px 16px; cursor:pointer;">+ 上传图纸</span>
-      </label>
+      <h2 style="margin:0;">📐 图纸</h2>
+      <div id="drawingActions" style="display:none;">
+        <button class="primary" onclick="openLinkModal()" style="margin-right:8px;">📚 从图纸库选择</button>
+        <label style="cursor:pointer;">
+          <input type="file" id="fileInput" style="display:none;" onchange="doUpload(event)">
+          <span class="primary" style="display:inline-block; padding:8px 16px; cursor:pointer;">+ 手动上传</span>
+        </label>
+      </div>
     </div>
     <table>
       <thead>
         <tr>
           <th>文件名</th>
+          <th>来源</th>
           <th>分类</th>
           <th>大小</th>
-          <th>上传时间</th>
-          <th style="width:80px;">操作</th>
+          <th>时间</th>
+          <th style="width:100px;">操作</th>
         </tr>
       </thead>
-      <tbody id="attsBody"><tr><td colspan="5" class="empty">加载中...</td></tr></tbody>
+      <tbody id="attsBody"><tr><td colspan="6" class="empty">加载中...</td></tr></tbody>
     </table>
   </div>
 </main>
+
+<!-- Modal: 从图纸库选择 -->
+<div class="modal-bg" id="linkModal">
+  <div class="modal" style="max-width:700px;">
+    <h3>从图纸库选择图纸</h3>
+    <div style="margin-bottom:12px;">
+      <input id="dlSearch" placeholder="搜索图纸名称..." style="width:200px; display:inline-block;" onkeyup="if(event.key==='Enter')loadLibrary()">
+      <button class="secondary" onclick="loadLibrary()">搜索</button>
+    </div>
+    <div style="max-height:300px; overflow-y:auto;">
+      <table>
+        <thead><tr><th style="width:30px;"></th><th>名称</th><th>文件</th><th>分类</th></tr></thead>
+        <tbody id="libBody"><tr><td colspan="4" class="empty">加载中...</td></tr></tbody>
+      </table>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="secondary" onclick="closeLinkModal()">取消</button>
+      <button type="button" class="primary" onclick="doLink()">关联选中</button>
+    </div>
+  </div>
+</div>
 
 <!-- Modal: 添加零件 -->
 <div class="modal-bg" id="partModal">
@@ -159,10 +184,12 @@
       </div>
       <label>零件名称</label>
       <input name="part_name">
-      <label>材质（如 45# 钢 / Cr12MoV / SKD61）</label>
-      <input name="material">
-      <label>工序简述 <span class="muted">(仅留作备注，精细工序请在零件行里点【管理工序】)</span></label>
-      <input name="processes" placeholder="磨,铣,热处理">
+      <label>材质 *</label>
+      <select name="material_id" id="materialSel" required>
+        <option value="">请选择材质...</option>
+      </select>
+      <label>工序（多选）</label>
+      <div id="processCheckboxes" style="display:flex; flex-wrap:wrap; gap:8px; padding:8px; background:#0f172a; border-radius:6px; max-height:120px; overflow-y:auto;"></div>
       <label>规格</label>
       <input name="spec">
       <div class="modal-actions">
@@ -280,7 +307,6 @@
       document.getElementById('btnConfirm').style.display = p.status === 'drafted' ? 'inline-block' : 'none';
       document.getElementById('btnAddPart').style.display = p.status === 'drafted' ? 'inline-block' : 'none';
       document.getElementById('btnAddMold').style.display = p.status === 'drafted' ? 'inline-block' : 'none';
-      document.getElementById('btnUpload').style.display   = p.status === 'drafted' ? 'inline-block' : 'none';
       document.getElementById('btnDecide').style.display   = p.status === 'confirmed' ? 'inline-block' : 'none';
 
       // Show "查看决策" when project already in deciding/decided
@@ -351,47 +377,110 @@
         }).join('');
       }
 
-      // Attachments
+      // 图纸（合并：手动上传 + 图纸库关联）
+      document.getElementById('drawingActions').style.display = p.status === 'drafted' ? 'flex' : 'none';
+
       const attsBody = document.getElementById('attsBody');
-      if (!data.attachments.length) {
-        attsBody.innerHTML = `<tr><td colspan="5" class="empty">还没有图纸，点【+ 上传图纸】</td></tr>`;
-      } else {
-        attsBody.innerHTML = data.attachments.map(a => `
+      const uploadedRows = (data.attachments || []).map(a => `
+        <tr>
+          <td>${App.esc(a.file_name)}</td>
+          <td><span class="badge drafted">手动上传</span></td>
+          <td><span class="badge">${App.esc(a.category || '—')}</span></td>
+          <td>${a.file_size ? (a.file_size/1024).toFixed(1) + ' KB' : '—'}</td>
+          <td class="muted">${App.fmtDate(a.created_at)}</td>
+          <td><a href="/api/internal/attachments/${a.id}/download" target="_blank">下载</a></td>
+        </tr>
+      `);
+
+      // 图纸库关联
+      let linkRows = [];
+      try {
+        const dlData = await App.api(`/api/internal/projects/${pid}/drawing-links`);
+        linkRows = (dlData.items || []).map(d => `
           <tr>
-            <td>${App.esc(a.file_name)}</td>
-            <td><span class="badge drafted">${App.esc(a.category || '—')}</span></td>
-            <td>${a.file_size ? (a.file_size/1024).toFixed(1) + ' KB' : '—'}</td>
-            <td class="muted">${App.fmtDate(a.created_at)}</td>
-            <td><a href="/api/internal/attachments/${a.id}/download" target="_blank">下载</a></td>
+            <td>${App.esc(d.file_name || d.name)}</td>
+            <td><span class="badge" style="background:#1e40af;color:#93c5fd;">图纸库</span></td>
+            <td><span class="badge">${App.esc(d.category || '—')}</span></td>
+            <td>${d.file_size ? (d.file_size/1024).toFixed(1) + ' KB' : '—'}</td>
+            <td class="muted">${App.fmtDate(d.linked_at)}</td>
+            <td>
+              <a href="/api/internal/drawing-library/${d.drawing_id}/download" target="_blank">下载</a>
+              ${p.status === 'drafted' ? `<button class="secondary" style="padding:2px 8px;font-size:11px;color:#f87171;margin-left:4px;" onclick="unlinkDrawing(${d.link_id})">移除</button>` : ''}
+            </td>
           </tr>
-        `).join('');
+        `);
+      } catch (e) { /* ignore */ }
+
+      const allRows = [...uploadedRows, ...linkRows];
+      if (!allRows.length) {
+        attsBody.innerHTML = `<tr><td colspan="6" class="empty">还没有图纸，点右上角按钮添加</td></tr>`;
+      } else {
+        attsBody.innerHTML = allRows.join('');
       }
+
     } catch (e) {
       showToast('❌ ' + e.message, 'error');
     }
   }
 
-  window.openPartModal = () => document.getElementById('partModal').classList.add('show');
+  window.openPartModal = async () => {
+    document.getElementById('partModal').classList.add('show');
+    await loadMaterialsDropdown();
+    await loadProcessCheckboxes();
+  };
   window.closePartModal = () => document.getElementById('partModal').classList.remove('show');
+
+  async function loadMaterialsDropdown() {
+    const sel = document.getElementById('materialSel');
+    if (sel.options.length > 1) return; // already loaded
+    const r = await App.api('/api/internal/materials');
+    const CAT_CN = { cold_work:'冷作', hot_work:'热作', plastic_mold:'塑胶', structural:'结构钢' };
+    for (const m of r.items) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = `${m.code} (${CAT_CN[m.category] || m.category || '—'})`;
+      sel.appendChild(opt);
+    }
+  }
+
+  async function loadProcessCheckboxes() {
+    const container = document.getElementById('processCheckboxes');
+    if (container.children.length > 0) return; // already loaded
+    const r = await App.api('/api/internal/process-methods');
+    for (const pm of r.items) {
+      const label = document.createElement('label');
+      label.style.cssText = 'cursor:pointer; display:flex; align-items:center; gap:4px; padding:4px 8px; background:#1e293b; border-radius:4px; font-size:13px;';
+      label.innerHTML = `<input type="checkbox" value="${pm.name}" data-id="${pm.id || pm.name}"> ${App.esc(pm.name)}`;
+      container.appendChild(label);
+    }
+  }
 
   window.doAddPart = async (ev) => {
     ev.preventDefault();
     const fd = new FormData(ev.target);
-    const proc = (fd.get('processes') || '').split(',').map(s => s.trim()).filter(Boolean);
+    // 收集选中的工序 IDs
+    const checkedBoxes = document.querySelectorAll('#processCheckboxes input[type="checkbox"]:checked');
+    const processMethodIds = Array.from(checkedBoxes).map(cb => cb.dataset.id).filter(Boolean);
+
+    const materialId = fd.get('material_id') ? parseInt(fd.get('material_id')) : null;
     const body = {
       part_no: fd.get('part_no') || null,
       part_type: fd.get('part_type'),
       mold_id: fd.get('mold_id') ? parseInt(fd.get('mold_id')) : null,
       part_name: fd.get('part_name') || null,
-      material: fd.get('material') || null,
+      material_id: materialId,
       qty: parseInt(fd.get('qty')) || 1,
-      processes: proc,
       spec: fd.get('spec') || null,
     };
+    if (processMethodIds.length > 0) {
+      body.process_method_ids = processMethodIds.map(Number);
+    }
     try {
       const r = await App.api(`/api/internal/projects/${pid}/parts`, { method:'POST', body });
       showToast(`✓ 零件已添加：${r.part_no}`);
       ev.target.reset();
+      // 取消所有工序勾选
+      document.querySelectorAll('#processCheckboxes input[type="checkbox"]').forEach(cb => cb.checked = false);
       closePartModal();
       load();
     } catch (e) {
@@ -446,6 +535,54 @@
       await App.api(`/api/internal/projects/${pid}/attachments`, { method:'POST', body: fd });
       showToast('✓ 图纸已上传');
       ev.target.value = '';
+      load();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
+  };
+
+  // === 图纸库关联 ===
+  window.openLinkModal = async () => {
+    document.getElementById('linkModal').classList.add('show');
+    await loadLibrary();
+  };
+  window.closeLinkModal = () => document.getElementById('linkModal').classList.remove('show');
+
+  window.loadLibrary = async () => {
+    const kw = document.getElementById('dlSearch').value.trim();
+    let url = '/api/internal/drawing-library?';
+    if (kw) url += `keyword=${encodeURIComponent(kw)}`;
+    const r = await App.api(url);
+    const body = document.getElementById('libBody');
+    if (!r.items.length) {
+      body.innerHTML = '<tr><td colspan="4" class="empty">无图纸</td></tr>';
+      return;
+    }
+    body.innerHTML = r.items.map(d => `
+      <tr>
+        <td><input type="checkbox" value="${d.id}" class="lib-check"></td>
+        <td>${App.esc(d.name)}</td>
+        <td><code>${App.esc(d.file_name)}</code></td>
+        <td>${App.esc(d.category || '—')}</td>
+      </tr>
+    `).join('');
+  };
+
+  window.doLink = async () => {
+    const checked = document.querySelectorAll('.lib-check:checked');
+    if (!checked.length) { showToast('请至少选择一张图纸', 'error'); return; }
+    const ids = Array.from(checked).map(cb => parseInt(cb.value));
+    try {
+      const r = await App.api(`/api/internal/projects/${pid}/drawing-links`, { method:'POST', body:{drawing_ids:ids} });
+      showToast(`✓ 已关联 ${r.linked_count} 张图纸`);
+      closeLinkModal();
+      load();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
+  };
+
+  window.unlinkDrawing = async (linkId) => {
+    if (!confirm('取消关联这张图纸？')) return;
+    try {
+      await App.api(`/api/internal/projects/${pid}/drawing-links/${linkId}`, { method:'DELETE' });
+      showToast('✓ 已取消关联');
       load();
     } catch (e) { showToast('❌ ' + e.message, 'error'); }
   };

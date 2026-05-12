@@ -42,14 +42,29 @@
   const user = App.requireTenantType('processor');
   document.getElementById('user-name').textContent = user.display_name || user.username;
 
-  (async () => {
+  function toast(msg, type='success') {
+    const t = document.getElementById('toast') || document.createElement('div');
+    if (!t.id) { t.id='toast'; t.className='toast'; document.body.appendChild(t); }
+    t.textContent = msg; t.className = 'toast show ' + type;
+    setTimeout(() => t.className = 'toast', 2500);
+  }
+
+  async function load() {
     const r = await App.api('/api/processor/my-exceptions');
     const body = document.getElementById('body');
-    if (!r.items.length) { body.innerHTML = `<tr><td colspan="8" class="empty">✓ 没有异常通知</td></tr>`; return; }
+    if (!r.items.length) { body.innerHTML = `<tr><td colspan="9" class="empty">✓ 没有异常通知</td></tr>`; return; }
     body.innerHTML = r.items.map(e => {
-      const rwHtml = (e.rework_orders || []).map(rw =>
-        `<code style="font-size:10px;">${App.esc(rw.rework_no)}</code> <span class="badge ${rw.status}">${rw.status}</span>`
-      ).join('<br>') || '—';
+      const rwHtml = (e.rework_orders || []).map(rw => {
+        let actionBtn = '';
+        if (rw.status === 'pending') {
+          actionBtn = `<button class="primary" style="padding:3px 10px;font-size:11px;margin-left:6px;" onclick="confirmRework(${rw.id})">确认返工</button>`;
+        } else if (rw.status === 'in_progress') {
+          actionBtn = `<a href="/static/processor/rework-detail.html?id=${rw.id}" style="font-size:11px;margin-left:6px;">交货 →</a>`;
+        } else if (rw.status === 'delivered' || rw.status === 'inspecting' || rw.status === 'completed') {
+          actionBtn = `<a href="/static/processor/rework-detail.html?id=${rw.id}" style="font-size:11px;margin-left:6px;">查看</a>`;
+        }
+        return `<code style="font-size:10px;">${App.esc(rw.rework_no)}</code> <span class="badge ${rw.status}">${rw.status}</span>${actionBtn}`;
+      }).join('<br>') || '—';
       return `<tr>
         <td><code>${App.esc(e.exception_no)}</code></td>
         <td>${App.esc(e.project_no)} · ${App.esc(e.project_name)}</td>
@@ -61,8 +76,25 @@
         <td class="muted">${App.fmtDate(e.created_at)}</td>
       </tr>`;
     }).join('');
-  })();
+  }
+
+  window.confirmRework = async (rwId) => {
+    const remark = prompt('确认返工备注（可选）：');
+    if (remark === null) return; // cancelled
+    try {
+      const r = await App.api(`/api/processor/rework-orders/${rwId}/confirm`, {
+        method: 'POST',
+        body: { remark: remark || null },
+      });
+      const branchMsg = r.branch === 'A' ? '（我方将安排补料）' : '（请自行采购材料并重新加工）';
+      toast(`✓ 已确认返工${branchMsg}`);
+      load();
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  };
+
+  load();
 })();
 </script>
+<div class="toast" id="toast"></div>
 </body>
 </html>

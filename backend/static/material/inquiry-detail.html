@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>材料询价详情 - MVP</title>
+<link rel="stylesheet" href="/static/common.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <a href="/static/material/home.html" style="color:inherit;">📦 材料方首页</a>
+    &nbsp;›&nbsp; <span style="color:#e2e8f0;">材料询价详情</span>
+  </div>
+  <div class="user">
+    <span class="badge material">material</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <h2>📨 询价信息</h2>
+    <div id="basic" style="margin-top:14px;">加载中...</div>
+  </div>
+
+  <div class="card" id="linesCard">
+    <h2>📋 材料明细</h2>
+    <table style="margin-top:14px;">
+      <thead>
+        <tr>
+          <th style="width:40px;">#</th>
+          <th>材料号</th>
+          <th>材料名称</th>
+          <th>规格</th>
+          <th>数量</th>
+          <th>单位</th>
+          <th style="width:120px;">单价（元）</th>
+          <th style="width:80px;">交期（天）</th>
+          <th>备注</th>
+        </tr>
+      </thead>
+      <tbody id="linesBody"></tbody>
+    </table>
+    <div style="margin-top:14px;">
+      <label>整体备注</label>
+      <textarea id="overallNote" rows="2" placeholder="可选"></textarea>
+    </div>
+    <div style="margin-top:12px; display:flex; justify-content:flex-end;">
+      <button class="primary" id="btnSubmit" onclick="submitQuote()">提交报价</button>
+    </div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('material');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+
+  const id = new URLSearchParams(location.search).get('id');
+  if (!id) { alert('缺少 id'); location.href = '/static/material/home.html'; return; }
+
+  function toast(msg, type='success') {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast show ' + type;
+    setTimeout(() => t.className = 'toast', 2500);
+  }
+
+  let _inquiryLines = [];
+
+  async function load() {
+    try {
+      const data = await App.api('/api/material/inquiries/' + id);
+      const inv = data.invitation;
+
+      document.getElementById('basic').innerHTML = `
+        <div><b>询价单号</b>: <code>${App.esc(inv.inquiry_no)}</code></div>
+        <div><b>标题</b>: ${App.esc(inv.title || '—')}</div>
+        <div><b>项目</b>: <code>${App.esc(inv.project_no)}</code> ${App.esc(inv.project_name || '')}</div>
+        <div style="margin-top:6px;">
+          <b>需求日期</b>: ${App.esc(inv.required_date || '—')}
+          &nbsp;|&nbsp; <b>状态</b>: <span class="badge ${inv.inquiry_status}">${App.esc(inv.inquiry_status)}</span>
+        </div>
+      `;
+
+      _inquiryLines = data.inquiry_lines || [];
+      const myQuoteLines = data.my_quote_lines || [];
+      const byLineId = {};
+      myQuoteLines.forEach(q => { if (q.inquiry_line_id) byLineId[q.inquiry_line_id] = q; });
+
+      const linesBody = document.getElementById('linesBody');
+
+      if (_inquiryLines.length > 0) {
+        // 多行模式
+        linesBody.innerHTML = _inquiryLines.map((line, idx) => {
+          const existing = byLineId[line.id];
+          return `<tr>
+            <td>${idx + 1}</td>
+            <td><b>${App.esc(line.material_code)}</b></td>
+            <td>${App.esc(line.material_name || '—')}</td>
+            <td>${App.esc(line.spec || '—')}</td>
+            <td>${line.qty}</td>
+            <td>${App.esc(line.unit || 'kg')}</td>
+            <td><input type="number" step="0.01" min="0.01" data-lid="${line.id}" class="q-price"
+                       value="${existing ? existing.unit_price : ''}"></td>
+            <td><input type="number" min="1" data-lid="${line.id}" class="q-lead"
+                       value="${existing ? existing.lead_time_days : ''}"></td>
+            <td><input data-lid="${line.id}" class="q-note"
+                       value="${existing ? App.esc(existing.note || '') : ''}"></td>
+          </tr>`;
+        }).join('');
+      } else {
+        // 单行模式（旧询价单，只有一种材料）
+        const existing = data.my_quote;
+        linesBody.innerHTML = `<tr>
+          <td>1</td>
+          <td><b>${App.esc(inv.material_code || '—')}</b></td>
+          <td>${App.esc(inv.material_name || '—')}</td>
+          <td>${App.esc(inv.spec || '—')}</td>
+          <td>${inv.qty || '—'}</td>
+          <td>${App.esc(inv.unit || 'kg')}</td>
+          <td><input type="number" step="0.01" min="0.01" id="single_price"
+                     value="${existing ? existing.unit_price : ''}"></td>
+          <td><input type="number" min="1" id="single_lead"
+                     value="${existing ? existing.lead_time_days : ''}"></td>
+          <td><input id="single_note"
+                     value="${existing ? App.esc(existing.note || '') : ''}"></td>
+        </tr>`;
+      }
+
+      if (data.my_quote || myQuoteLines.length > 0) {
+        document.getElementById('btnSubmit').textContent = '更新报价';
+      }
+
+      if (inv.inquiry_status !== 'inviting') {
+        document.getElementById('btnSubmit').disabled = true;
+        document.getElementById('btnSubmit').textContent = '报价已截止';
+        document.querySelectorAll('#linesCard input, #linesCard textarea').forEach(e => e.disabled = true);
+      }
+
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  }
+
+  window.submitQuote = async () => {
+    const note = document.getElementById('overallNote').value.trim() || null;
+
+    if (_inquiryLines.length > 0) {
+      // 多行模式
+      const lines = [];
+      for (const line of _inquiryLines) {
+        const priceEl = document.querySelector(`.q-price[data-lid="${line.id}"]`);
+        const leadEl = document.querySelector(`.q-lead[data-lid="${line.id}"]`);
+        const noteEl = document.querySelector(`.q-note[data-lid="${line.id}"]`);
+        const price = parseFloat(priceEl.value);
+        const lead = parseInt(leadEl.value);
+        if (!(price > 0) || !(lead > 0)) {
+          toast('❌ 每行都必须填单价和交期', 'error');
+          return;
+        }
+        lines.push({
+          inquiry_line_id: line.id,
+          unit_price: price,
+          lead_time_days: lead,
+          note: noteEl.value.trim() || null,
+        });
+      }
+      try {
+        const r = await App.api(`/api/material/inquiries/${id}/quote`, {
+          method: 'POST',
+          body: { lines, note },
+        });
+        toast(`✓ 报价已提交，共 ${r.line_count} 行`);
+        setTimeout(load, 500);
+      } catch (e) { toast('❌ ' + e.message, 'error'); }
+    } else {
+      // 单行模式
+      const price = parseFloat(document.getElementById('single_price').value);
+      const lead = parseInt(document.getElementById('single_lead').value);
+      const lineNote = document.getElementById('single_note').value.trim() || null;
+      if (!(price > 0) || !(lead > 0)) {
+        toast('❌ 请填写正确的单价和交期', 'error');
+        return;
+      }
+      try {
+        await App.api(`/api/material/inquiries/${id}/quote`, {
+          method: 'POST',
+          body: { unit_price: price, lead_time_days: lead, note: lineNote },
+        });
+        toast('✓ 报价已提交');
+        setTimeout(load, 500);
+      } catch (e) { toast('❌ ' + e.message, 'error'); }
+    }
+  };
+
+  load();
+})();
+</script>
+</body>
+</html>

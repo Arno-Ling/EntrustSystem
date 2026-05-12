@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>返工单详情 - 加工方</title>
+<link rel="stylesheet" href="/static/common.css">
+<style>
+.timeline { margin:14px 0; padding-left:20px; border-left:2px solid #334155; }
+.timeline .step { padding:8px 0 8px 14px; position:relative; }
+.timeline .step::before { content:''; position:absolute; left:-7px; top:12px; width:12px; height:12px; border-radius:50%; background:#334155; }
+.timeline .step.done::before { background:#10b981; }
+.timeline .step.active::before { background:#3b82f6; box-shadow:0 0 6px #3b82f6; }
+.photo-grid { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.photo-grid img { width:100px; height:100px; object-fit:cover; border-radius:6px; border:1px solid #334155; }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <a href="/static/processor/my-exceptions.html" style="color:inherit;">🏭 异常通知</a>
+    &nbsp;›&nbsp; <span style="color:#e2e8f0;">返工单详情</span>
+  </div>
+  <div class="user">
+    <span class="badge processor">processor</span>
+    <span id="user-name">—</span>
+    <button class="logout" onclick="App.logout()">退出</button>
+  </div>
+</header>
+
+<main>
+  <div class="card">
+    <h2>🔧 返工单 <code id="rwNo"></code> <span id="statusBadge" class="badge"></span></h2>
+    <div id="basic" style="margin-top:14px;">加载中...</div>
+  </div>
+
+  <div class="card">
+    <h2>📸 交货照片</h2>
+    <div class="photo-grid" id="photos"></div>
+    <div id="uploadArea" style="margin-top:12px; display:none;">
+      <label style="cursor:pointer;">
+        <input type="file" id="photoInput" style="display:none;" onchange="doUploadPhoto(event)" accept="image/*">
+        <span class="primary" style="display:inline-block; padding:8px 16px; cursor:pointer;">+ 上传照片</span>
+      </label>
+    </div>
+  </div>
+
+  <div class="card" id="actionCard" style="display:none;">
+    <h2>⚡ 操作</h2>
+    <div id="actions" style="margin-top:14px;"></div>
+  </div>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script>
+(function () {
+  const user = App.requireTenantType('processor');
+  document.getElementById('user-name').textContent = user.display_name || user.username;
+
+  const id = new URLSearchParams(location.search).get('id');
+  if (!id) { alert('缺少 id'); location.href = '/static/processor/my-exceptions.html'; return; }
+
+  function toast(msg, type='success') {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className = 'toast show ' + type;
+    setTimeout(() => t.className = 'toast', 2500);
+  }
+
+  async function load() {
+    try {
+      const data = await App.api(`/api/processor/rework-orders/${id}`);
+      const rw = data.rework_order;
+      const exc = data.exception || {};
+
+      document.getElementById('rwNo').textContent = rw.rework_no;
+      const badge = document.getElementById('statusBadge');
+      badge.textContent = rw.status;
+      badge.className = 'badge ' + rw.status;
+
+      const modeText = rw.material_sourcing_mode === 'internal'
+        ? '📦 我方供料（系统已安排补料）'
+        : rw.material_sourcing_mode === 'processor'
+        ? '🛒 自行采购材料并重新加工'
+        : '待确认';
+
+      document.getElementById('basic').innerHTML = `
+        <div><b>异常单</b>: <code>${App.esc(exc.exception_no || '—')}</code> — ${App.esc(exc.exception_type || '')} (${App.esc(exc.severity || '')})</div>
+        <div style="margin-top:6px;"><b>异常描述</b>: ${App.esc(exc.description || '—')}</div>
+        <div style="margin-top:8px; padding:8px; background:#1e293b; border-radius:6px;">
+          <b>材料模式</b>: ${modeText}
+        </div>
+        <div style="margin-top:8px;"><b>费用承担</b>: <span style="color:#f87171;">${rw.cost_bearer || '—'}</span>
+          ${rw.cost_amount ? ' ¥' + rw.cost_amount : ''}
+          ${rw.cost_remark ? ' (' + App.esc(rw.cost_remark) + ')' : ''}
+        </div>
+        <div class="timeline" style="margin-top:14px;">
+          <div class="step ${rw.status !== 'pending' ? 'done' : 'active'}">
+            <b>待确认</b> ${rw.confirm_remark ? '— ' + App.esc(rw.confirm_remark) : ''}
+            ${rw.confirmed_at ? '<span class="muted"> ' + App.fmtDate(rw.confirmed_at) + '</span>' : ''}
+          </div>
+          <div class="step ${['in_progress','delivered','inspecting','completed'].includes(rw.status) ? 'done' : rw.status === 'confirmed' ? 'active' : ''}">
+            <b>加工中</b>
+          </div>
+          <div class="step ${['delivered','inspecting','completed'].includes(rw.status) ? 'done' : rw.status === 'in_progress' ? 'active' : ''}">
+            <b>已交货</b> ${rw.deliver_remark ? '— ' + App.esc(rw.deliver_remark) : ''}
+            ${rw.delivered_at ? '<span class="muted"> ' + App.fmtDate(rw.delivered_at) + '</span>' : ''}
+          </div>
+          <div class="step ${['inspecting','completed'].includes(rw.status) ? 'done' : rw.status === 'delivered' ? 'active' : ''}">
+            <b>质检中</b>
+            ${rw.inspected_at ? '<span class="muted"> ' + App.fmtDate(rw.inspected_at) + '</span>' : ''}
+          </div>
+          <div class="step ${rw.status === 'completed' ? 'done' : ''}">
+            <b>完成</b>
+            ${rw.completed_at ? '<span class="muted"> ' + App.fmtDate(rw.completed_at) + '</span>' : ''}
+          </div>
+        </div>
+      `;
+
+      // 照片
+      const photos = rw.deliver_photos || [];
+      const photosEl = document.getElementById('photos');
+      if (photos.length) {
+        photosEl.innerHTML = photos.map(p =>
+          `<img src="/uploads/${p}" onclick="window.open('/uploads/${p}','_blank')">`
+        ).join('');
+      } else {
+        photosEl.innerHTML = '<span class="muted">暂无照片</span>';
+      }
+
+      // 上传区域（in_progress 时可上传）
+      document.getElementById('uploadArea').style.display =
+        rw.status === 'in_progress' ? 'block' : 'none';
+
+      // 操作按钮
+      const actionCard = document.getElementById('actionCard');
+      const actionsEl = document.getElementById('actions');
+      if (rw.status === 'pending') {
+        actionCard.style.display = '';
+        actionsEl.innerHTML = `
+          <p>请确认接受此返工任务：</p>
+          <textarea id="confirmRemark" rows="2" placeholder="备注（可选）" style="width:100%;margin-bottom:10px;"></textarea>
+          <button class="primary" onclick="doConfirm()">✓ 确认返工</button>
+        `;
+      } else if (rw.status === 'in_progress') {
+        actionCard.style.display = '';
+        actionsEl.innerHTML = `
+          <p>完成加工后，请上传照片并标记交货：</p>
+          <textarea id="deliverRemark" rows="2" placeholder="交货备注（可选）" style="width:100%;margin-bottom:10px;"></textarea>
+          <button class="primary" onclick="doDeliver()">📦 标记交货</button>
+        `;
+      } else {
+        actionCard.style.display = 'none';
+      }
+
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  }
+
+  window.doConfirm = async () => {
+    const remark = document.getElementById('confirmRemark').value.trim();
+    try {
+      const r = await App.api(`/api/processor/rework-orders/${id}/confirm`, {
+        method: 'POST', body: { remark: remark || null },
+      });
+      const msg = r.branch === 'A' ? '已确认，系统已安排补料' : '已确认，请自行采购材料并重新加工';
+      toast('✓ ' + msg);
+      setTimeout(load, 500);
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  };
+
+  window.doDeliver = async () => {
+    const remark = document.getElementById('deliverRemark').value.trim();
+    try {
+      await App.api(`/api/processor/rework-orders/${id}/deliver`, {
+        method: 'POST', body: { remark: remark || null },
+      });
+      toast('✓ 已标记交货，等待质检');
+      setTimeout(load, 500);
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  };
+
+  window.doUploadPhoto = async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      await App.api(`/api/processor/rework-orders/${id}/photos`, { method:'POST', body:fd });
+      toast('✓ 照片已上传');
+      ev.target.value = '';
+      load();
+    } catch (e) { toast('❌ ' + e.message, 'error'); }
+  };
+
+  load();
+})();
+</script>
+</body>
+</html>

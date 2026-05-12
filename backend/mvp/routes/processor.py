@@ -29,6 +29,7 @@ class QuoteLine(BaseModel):
     scope_item_id:   int
     unit_price:      float = Field(..., gt=0)
     lead_time_days:  int = Field(..., ge=1)
+    material_unit_price: Optional[float] = None
     note: Optional[str] = None
 
 
@@ -125,7 +126,7 @@ async def get_invitation(
         """
         SELECT i.*, r.id AS req_id, r.title AS request_title,
                r.required_processes_json, r.quantity, r.deadline,
-               r.status AS request_status,
+               r.status AS request_status, r.material_sourcing,
                p.id AS project_id, p.project_no, p.name AS project_name,
                p.customer, p.unit_price AS client_unit_price
         FROM outsource_request_invitations i
@@ -220,7 +221,7 @@ async def submit_quote(
 ):
     inv = db.fetch_one(
         """
-        SELECT i.*, r.status AS request_status
+        SELECT i.*, r.status AS request_status, r.material_sourcing
         FROM outsource_request_invitations i
         JOIN outsource_requests r ON i.request_id = r.id
         WHERE i.id = %s
@@ -240,7 +241,15 @@ async def submit_quote(
 
     # 支持两种模式：传统整单一口价 / 逐项 lines
     lines = payload.lines or []
+    material_sourcing = inv.get("material_sourcing")
+
     if lines:
+        # 加工方自采模式：校验 material_unit_price
+        if material_sourcing == "processor":
+            for l in lines:
+                if l.material_unit_price is None or l.material_unit_price <= 0:
+                    raise HTTPException(status_code=400,
+                                        detail="加工方自采模式下必须填写每行材料单价")
         # 汇总：unit_price = sum(line_price), lead_time_days = max(line)
         agg_price = sum(l.unit_price for l in lines)
         agg_lead = max(l.lead_time_days for l in lines)
@@ -280,14 +289,16 @@ async def submit_quote(
                     (quotation_id,),
                 )
                 for l in lines:
+                    # internal 模式下忽略 material_unit_price
+                    mat_price = l.material_unit_price if material_sourcing == "processor" else None
                     cur.execute(
                         """
                         INSERT INTO outsource_quotation_lines
-                            (quotation_id, scope_item_id, unit_price, lead_time_days, note)
-                        VALUES (%s, %s, %s, %s, %s)
+                            (quotation_id, scope_item_id, unit_price, lead_time_days, note, material_unit_price)
+                        VALUES (%s, %s, %s, %s, %s, %s)
                         """,
                         (quotation_id, l.scope_item_id,
-                         l.unit_price, l.lead_time_days, l.note),
+                         l.unit_price, l.lead_time_days, l.note, mat_price),
                     )
 
             cur.execute(
@@ -658,3 +669,219 @@ async def download_attachment(
         filename=att["file_name"],
         media_type=att.get("mime_type") or "application/octet-stream",
     )
+
+
+# =============================================================================
+# 返工单（加工方视角）
+# =============================================================================
+
+class ReworkConfirm(BaseModel):
+    remark: Optional[str] = None
+
+
+class ReworkDeliver(BaseModel):
+    remark: Optional[str] = None
+
+
+REWORK_TRANSITIONS = {
+    "pending":     {"confirmed", "cancelled"},
+    "confirmed":   {"in_progress", "cancelled"},
+    "in_progress": {"delivered", "cancelled"},
+    "delivered":   {"inspecting", "cancelled"},
+    "inspecting":  {"completed", "cancelled"},
+    "completed":   set(),
+    "cancelled":   set(),
+}
+
+
+def _rework_tenant_check(rework_id: int, user: CurrentUser) -> dict | None:
+    """校验返工单归属加工方。返回 rework_order 行或 None。"""
+    row = db.fetch_one(
+        """
+        SELECT rw.*, o.tenant_id AS order_tenant_id
+        FROM rework_orders rw
+        LEFT JOIN outsource_orders o ON rw.original_order_id = o.id
+        WHERE rw.id = %s
+        """,
+        (rework_id,),
+    )
+    if row is None:
+        return None
+    if row["order_tenant_id"] != _my_tenant_id(user):
+        return None
+    return row
+
+
+@router.get("/rework-orders")
+async def list_rework_orders(user: CurrentUser = Depends(_require_processor)):
+    """加工方查看自己的返工单列表。"""
+    rows = db.fetch_all(
+        """
+        SELECT rw.id, rw.rework_no, rw.status, rw.rework_type,
+               rw.material_sourcing_mode, rw.cost_bearer,
+               rw.confirmed_at, rw.delivered_at, rw.completed_at,
+               rw.created_at,
+               p.project_no, p.name AS project_name,
+               e.exception_no, e.exception_type, e.severity
+        FROM rework_orders rw
+        JOIN projects p ON rw.project_id = p.id
+        LEFT JOIN quality_exceptions e ON rw.exception_id = e.id
+        LEFT JOIN outsource_orders o ON rw.original_order_id = o.id
+        WHERE o.tenant_id = %s
+        ORDER BY rw.created_at DESC
+        LIMIT 100
+        """,
+        (_my_tenant_id(user),),
+    )
+    stats = {
+        "pending": sum(1 for r in rows if r["status"] == "pending"),
+        "in_progress": sum(1 for r in rows if r["status"] == "in_progress"),
+        "delivered": sum(1 for r in rows if r["status"] == "delivered"),
+        "completed": sum(1 for r in rows if r["status"] == "completed"),
+    }
+    return {"items": rows, "total": len(rows), "stats": stats}
+
+
+@router.get("/rework-orders/{rework_id}")
+async def get_rework_order(
+    rework_id: int,
+    user: CurrentUser = Depends(_require_processor),
+):
+    """加工方查看返工单详情。"""
+    row = _rework_tenant_check(rework_id, user)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Rework order not found")
+
+    # 关联的异常信息
+    exc = db.fetch_one(
+        "SELECT exception_no, exception_type, severity, description FROM quality_exceptions WHERE id=%s",
+        (row["exception_id"],),
+    )
+
+    return {
+        "rework_order": row,
+        "exception": exc,
+    }
+
+
+@router.post("/rework-orders/{rework_id}/confirm")
+async def confirm_rework(
+    rework_id: int,
+    payload: ReworkConfirm,
+    user: CurrentUser = Depends(_require_processor),
+):
+    """加工方确认返工单。"""
+    row = _rework_tenant_check(rework_id, user)
+    if row is None:
+        raise HTTPException(status_code=404)
+    if row["status"] != "pending":
+        raise HTTPException(status_code=409,
+                            detail=f"返工单当前状态 '{row['status']}' 不允许确认，需为 pending")
+
+    from mvp.rework_service import process_rework_confirmation
+
+    now = datetime.utcnow()
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            # 确认
+            cur.execute(
+                """
+                UPDATE rework_orders
+                SET status='confirmed', confirmed_at=%s, confirmed_by=%s, confirm_remark=%s
+                WHERE id=%s
+                """,
+                (now, user.user_id, payload.remark, rework_id),
+            )
+            # 分支处理
+            result = process_rework_confirmation(rework_id, cur)
+
+    return {
+        "rework_id": rework_id,
+        "status": "in_progress",
+        "branch": result["branch"],
+        "material_sourcing_mode": result["material_sourcing_mode"],
+        "new_po_id": result["new_po_id"],
+    }
+
+
+@router.post("/rework-orders/{rework_id}/deliver")
+async def deliver_rework(
+    rework_id: int,
+    payload: ReworkDeliver,
+    user: CurrentUser = Depends(_require_processor),
+):
+    """加工方标记返工交货。"""
+    row = _rework_tenant_check(rework_id, user)
+    if row is None:
+        raise HTTPException(status_code=404)
+    if row["status"] != "in_progress":
+        raise HTTPException(status_code=409,
+                            detail=f"返工单当前状态 '{row['status']}' 不允许交货，需为 in_progress")
+
+    # 校验照片
+    photos = row.get("deliver_photos") or []
+    if not photos:
+        raise HTTPException(status_code=400,
+                            detail="交货前必须上传至少 1 张照片")
+
+    now = datetime.utcnow()
+    db.execute(
+        """
+        UPDATE rework_orders
+        SET status='delivered', delivered_at=%s, deliver_remark=%s
+        WHERE id=%s
+        """,
+        (now, payload.remark, rework_id),
+    )
+    return {"rework_id": rework_id, "status": "delivered", "delivered_at": now.isoformat()}
+
+
+@router.post("/rework-orders/{rework_id}/photos")
+async def upload_rework_photo(
+    rework_id: int,
+    file: UploadFile = File(...),
+    user: CurrentUser = Depends(_require_processor),
+):
+    """上传返工照片。"""
+    row = _rework_tenant_check(rework_id, user)
+    if row is None:
+        raise HTTPException(status_code=404)
+
+    # 保存文件
+    target_dir = UPLOADS_DIR / "rework"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    ext = Path(file.filename or "").suffix
+    stored = f"rw{rework_id}_{_uuid.uuid4().hex[:8]}{ext}"
+    target = target_dir / stored
+    with target.open("wb") as f:
+        _shutil.copyfileobj(file.file, f)
+    rel = f"rework/{stored}"
+
+    # 追加到 deliver_photos
+    existing = row.get("deliver_photos") or []
+    existing = [*existing, rel]
+    db.execute(
+        "UPDATE rework_orders SET deliver_photos = %s WHERE id = %s",
+        (json.dumps(existing), rework_id),
+    )
+    return {"path": rel, "url": f"/uploads/{rel}", "total_photos": len(existing)}
+
+
+@router.delete("/rework-orders/{rework_id}/photos")
+async def delete_rework_photo(
+    rework_id: int,
+    path: str,
+    user: CurrentUser = Depends(_require_processor),
+):
+    """删除一张返工照片。"""
+    row = _rework_tenant_check(rework_id, user)
+    if row is None:
+        raise HTTPException(status_code=404)
+
+    existing = row.get("deliver_photos") or []
+    new_list = [p for p in existing if p != path]
+    db.execute(
+        "UPDATE rework_orders SET deliver_photos = %s WHERE id = %s",
+        (json.dumps(new_list), rework_id),
+    )
+    return {"remaining": len(new_list)}

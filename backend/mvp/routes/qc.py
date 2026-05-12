@@ -496,9 +496,72 @@ async def confirm_exception(
             responsible_tenant_id = (row or {}).get("tid")
 
     rework_order_id = None
+    redelivery_request_id = None
+
+    # === 材料方责任特殊处理 ===
+    # 查询原单的 material_sourcing 模式
+    material_sourcing_for_exception = None
+    if payload.responsible_party == "material_supplier" and exc["inspection_id"]:
+        # 尝试从关联的 outsource_order 获取 material_sourcing
+        ms_row = db.fetch_one(
+            """
+            SELECT o.material_sourcing
+            FROM inspections i
+            JOIN outsource_orders o ON i.subject_type='outsource' AND o.id = i.subject_id
+            WHERE i.id = %s
+            """,
+            (exc["inspection_id"],),
+        )
+        if ms_row:
+            material_sourcing_for_exception = ms_row["material_sourcing"]
+        if not material_sourcing_for_exception:
+            # 尝试从 material_purchase_orders 关联的 outsource_order 获取
+            ms_row2 = db.fetch_one(
+                """
+                SELECT o.material_sourcing
+                FROM inspections i
+                JOIN material_purchase_orders mpo ON i.subject_type='material' AND mpo.id = i.subject_id
+                JOIN outsource_orders o ON mpo.outsource_order_id = o.id
+                WHERE i.id = %s
+                """,
+                (exc["inspection_id"],),
+            )
+            if ms_row2:
+                material_sourcing_for_exception = ms_row2["material_sourcing"]
+
+    # 材料方责任 + 加工方找的材料方 → 责任推给加工方
+    actual_responsible_party = payload.responsible_party
+    actual_resolution_path = payload.resolution_path
+    override_to_processor = False
+
+    if payload.responsible_party == "material_supplier" and material_sourcing_for_exception == "processor":
+        actual_responsible_party = "processor"
+        actual_resolution_path = "rework_process"
+        override_to_processor = True
+        # 重新查找加工方 tenant_id
+        if exc["inspection_id"]:
+            row = db.fetch_one(
+                """
+                SELECT o.tenant_id AS tid
+                FROM inspections i
+                JOIN outsource_orders o ON i.subject_type IN ('outsource','material') AND o.id = (
+                    CASE WHEN i.subject_type='outsource' THEN i.subject_id
+                         ELSE (SELECT outsource_order_id FROM material_purchase_orders WHERE id=i.subject_id)
+                    END
+                )
+                WHERE i.id = %s
+                """,
+                (exc["inspection_id"],),
+            )
+            if row:
+                responsible_tenant_id = row["tid"]
+
     with db.get_conn() as conn:
         with conn.cursor() as cur:
-            # 1) 责任判定记录
+            # 1) 责任判定记录（记录原始判定 + 是否被覆盖）
+            override_reason = None
+            if override_to_processor:
+                override_reason = "材料方责任但加工方自选材料方，责任转移至加工方"
             cur.execute(
                 """
                 INSERT INTO exception_responsibility
@@ -507,8 +570,9 @@ async def confirm_exception(
                      confirmed_by, confirmed_at)
                 VALUES (%s, %s, %s, %s, %s, FALSE, %s, %s)
                 """,
-                (exception_id, payload.responsible_party, responsible_tenant_id,
-                 payload.responsibility_ratio, payload.reason,
+                (exception_id, actual_responsible_party, responsible_tenant_id,
+                 payload.responsibility_ratio,
+                 (override_reason + " | " if override_reason else "") + (payload.reason or ""),
                  user.user_id, now),
             )
 
@@ -521,14 +585,53 @@ async def confirm_exception(
                     confirmed_by = %s, confirmed_at = %s
                 WHERE id = %s
                 """,
-                (payload.resolution_path, user.user_id, now, exception_id),
+                (actual_resolution_path, user.user_id, now, exception_id),
             )
 
-            # 3) 生成 rework_order（除 concession 外）
-            if payload.resolution_path in ("rework_material", "rework_process", "claim"):
+            # 3a) 材料方责任 + 我方供料 → 创建补发请求（不创建 rework_order）
+            if payload.responsible_party == "material_supplier" and material_sourcing_for_exception == "internal" and not override_to_processor:
+                orig_po_id = None
+                if exc["inspection_id"]:
+                    orig = db.fetch_one(
+                        "SELECT subject_type, subject_id FROM inspections WHERE id=%s",
+                        (exc["inspection_id"],),
+                    )
+                    if orig and orig["subject_type"] == "material":
+                        orig_po_id = orig["subject_id"]
+
+                # 从原 MPO 获取信息
+                mpo_info = None
+                if orig_po_id:
+                    mpo_info = db.fetch_one(
+                        "SELECT supplier_id, tenant_id, material_code, spec, qty, unit FROM material_purchase_orders WHERE id=%s",
+                        (orig_po_id,),
+                    )
+
+                cur.execute(
+                    """
+                    INSERT INTO material_redelivery_requests
+                        (exception_id, original_po_id, supplier_id, tenant_id, project_id,
+                         material_code, spec, qty, unit, status, remark, created_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s)
+                    RETURNING id
+                    """,
+                    (exception_id, orig_po_id,
+                     mpo_info["supplier_id"] if mpo_info else None,
+                     mpo_info["tenant_id"] if mpo_info else None,
+                     exc["project_id"],
+                     mpo_info["material_code"] if mpo_info else None,
+                     mpo_info["spec"] if mpo_info else None,
+                     mpo_info["qty"] if mpo_info else None,
+                     mpo_info["unit"] if mpo_info else "kg",
+                     f"材料方责任补发 - 异常 {exc['exception_no'] if exc.get('exception_no') else exception_id}",
+                     user.user_id),
+                )
+                redelivery_request_id = cur.fetchone()[0]
+
+            # 3b) 生成 rework_order（processor 责任或被覆盖为 processor）
+            elif actual_resolution_path in ("rework_material", "rework_process", "claim"):
                 rw_no = _gen_rework_no(exc["project_no"])
-                rw_type = "material" if payload.resolution_path == "rework_material" else "process"
-                # 原单据关联
+                rw_type = "material" if actual_resolution_path == "rework_material" else "process"
                 orig_po_id = None
                 orig_order_id = None
                 if exc["inspection_id"]:
@@ -553,15 +656,17 @@ async def confirm_exception(
                     """,
                     (rw_no, exception_id, exc["project_id"], rw_type,
                      orig_po_id, orig_order_id,
-                     payload.resolution_path == "claim",
+                     actual_resolution_path == "claim",
                      user.user_id),
                 )
                 rework_order_id = cur.fetchone()[0]
 
     return {
         "status": "responsibility_confirmed",
-        "resolution_path": payload.resolution_path,
+        "resolution_path": actual_resolution_path,
         "rework_order_id": rework_order_id,
+        "redelivery_request_id": redelivery_request_id,
+        "override_to_processor": override_to_processor,
     }
 
 
@@ -842,6 +947,132 @@ async def update_rework_status(
         (payload.status, rework_id),
     )
     return {"status": payload.status}
+
+
+@router.post("/rework-orders/{rework_id}/inspect")
+async def start_rework_inspection(
+    rework_id: int,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """触发返工质检（delivered → inspecting）"""
+    row = db.fetch_one(
+        """
+        SELECT rw.id, rw.status, p.tenant_id
+        FROM rework_orders rw
+        JOIN projects p ON rw.project_id = p.id
+        WHERE rw.id = %s
+        """,
+        (rework_id,),
+    )
+    if row is None or row["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+    if row["status"] != "delivered":
+        raise HTTPException(status_code=409,
+                            detail=f"返工单当前状态 '{row['status']}'，需为 delivered 才能质检")
+    now = datetime.utcnow()
+    db.execute(
+        "UPDATE rework_orders SET status='inspecting', inspected_at=%s WHERE id=%s",
+        (now, rework_id),
+    )
+    return {"rework_id": rework_id, "status": "inspecting", "inspected_at": now.isoformat()}
+
+
+@router.post("/rework-orders/{rework_id}/complete")
+async def complete_rework(
+    rework_id: int,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """返工质检通过（inspecting → completed）"""
+    row = db.fetch_one(
+        """
+        SELECT rw.id, rw.status, rw.exception_id, p.tenant_id
+        FROM rework_orders rw
+        JOIN projects p ON rw.project_id = p.id
+        WHERE rw.id = %s
+        """,
+        (rework_id,),
+    )
+    if row is None or row["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+    if row["status"] != "inspecting":
+        raise HTTPException(status_code=409,
+                            detail=f"返工单当前状态 '{row['status']}'，需为 inspecting 才能完成")
+    now = datetime.utcnow()
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE rework_orders SET status='completed', completed_at=%s WHERE id=%s",
+                (now, rework_id),
+            )
+            # 自动解决关联异常
+            if row["exception_id"]:
+                cur.execute(
+                    "UPDATE quality_exceptions SET status='resolved', resolved_at=%s WHERE id=%s AND status != 'resolved'",
+                    (now, row["exception_id"]),
+                )
+    return {"rework_id": rework_id, "status": "completed", "completed_at": now.isoformat()}
+
+
+@router.post("/rework-orders/{rework_id}/receive-material")
+async def receive_rework_material(
+    rework_id: int,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """确认补料已收货（Branch A 专用，更新关联 MPO 状态）"""
+    row = db.fetch_one(
+        """
+        SELECT rw.id, rw.new_po_id, rw.material_sourcing_mode, p.tenant_id
+        FROM rework_orders rw
+        JOIN projects p ON rw.project_id = p.id
+        WHERE rw.id = %s
+        """,
+        (rework_id,),
+    )
+    if row is None or row["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+    if not row["new_po_id"]:
+        raise HTTPException(status_code=400, detail="该返工单没有关联补料单")
+
+    db.execute(
+        "UPDATE material_purchase_orders SET status='received' WHERE id=%s",
+        (row["new_po_id"],),
+    )
+    return {"rework_id": rework_id, "po_id": row["new_po_id"], "po_status": "received"}
+
+
+@router.post("/redelivery-requests/{request_id}/receive")
+async def receive_redelivery(
+    request_id: int,
+    user: CurrentUser = Depends(_require_internal),
+):
+    """确认材料方补发已收货 → 解决关联异常"""
+    row = db.fetch_one(
+        """
+        SELECT mrr.id, mrr.status, mrr.exception_id, p.tenant_id
+        FROM material_redelivery_requests mrr
+        JOIN projects p ON mrr.project_id = p.id
+        WHERE mrr.id = %s
+        """,
+        (request_id,),
+    )
+    if row is None or row["tenant_id"] != user.tenant_id:
+        raise HTTPException(status_code=404)
+    if row["status"] not in ("pending", "shipped"):
+        raise HTTPException(status_code=409, detail=f"当前状态 '{row['status']}' 不允许确认收货")
+
+    now = datetime.utcnow()
+    with db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE material_redelivery_requests SET status='received', received_at=%s WHERE id=%s",
+                (now, request_id),
+            )
+            if row["exception_id"]:
+                cur.execute(
+                    "UPDATE quality_exceptions SET status='resolved', resolved_at=%s WHERE id=%s AND status != 'resolved'",
+                    (now, row["exception_id"]),
+                )
+    return {"request_id": request_id, "status": "received"}
 
 
 # =============================================================================

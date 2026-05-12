@@ -43,6 +43,8 @@
     <div class="tab"        data-tab="moq">📦 MOQ 规则</div>
     <div class="tab"        data-tab="inv">🏭 库存</div>
     <div class="tab"        data-tab="sup">🏢 供应商</div>
+    <div class="tab"        data-tab="materials">🧱 材质字典</div>
+    <div class="tab"        data-tab="drawings">📐 图纸库</div>
   </div>
 
   <!-- 原料价格 -->
@@ -172,6 +174,49 @@
     <p class="muted" style="font-size:11px; margin-top:10px;">
       💡 工艺能力中带 <span style="color:#fca5a5;">⚠</span> 表示该工艺我方不具备能力（强制委外类）。点击【编辑能力】可勾选。
     </p>
+  </div>
+  <!-- 材质字典 -->
+  <div class="panel" data-panel="materials" style="display:none;">
+    <div class="crud-toolbar">
+      <div></div>
+      <button class="primary" onclick="openMaterialModal()">+ 新增材质</button>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>编码</th><th>名称</th><th>分类</th><th>备注</th><th>状态</th><th style="width:120px;">操作</th>
+        </tr></thead>
+        <tbody id="materialsBody"><tr><td colspan="6" class="empty">—</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- 图纸库 -->
+  <div class="panel" data-panel="drawings" style="display:none;">
+    <div class="crud-toolbar">
+      <div style="display:flex; gap:10px; align-items:center;">
+        <input type="text" id="drawingQ" placeholder="🔍 搜图纸名称..." oninput="loadDrawings()" style="width:200px;">
+        <select id="drawingCatFilter" onchange="loadDrawings()" style="width:120px;">
+          <option value="">全部分类</option>
+          <option value="mold">模具图</option>
+          <option value="part">零件图</option>
+          <option value="assembly">装配图</option>
+          <option value="other">其他</option>
+        </select>
+      </div>
+      <label style="cursor:pointer;">
+        <input type="file" id="drawingFileInput" style="display:none;" onchange="doUploadDrawing(event)">
+        <span class="primary" style="display:inline-block; padding:8px 16px; cursor:pointer;">+ 上传图纸</span>
+      </label>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr>
+          <th>名称</th><th>文件</th><th>分类</th><th>标签</th><th>大小</th><th>上传时间</th><th style="width:100px;">操作</th>
+        </tr></thead>
+        <tbody id="drawingsBody"><tr><td colspan="7" class="empty">—</td></tr></tbody>
+      </table>
+    </div>
   </div>
 </main>
 
@@ -353,6 +398,69 @@
   </div>
 </div>
 
+<!-- 材质 modal -->
+<div class="modal-bg" id="materialModal">
+  <div class="modal">
+    <h3 id="materialModalTitle">新增材质</h3>
+    <form onsubmit="return submitMaterial(event)">
+      <input type="hidden" id="mat_edit_id">
+      <div class="flex">
+        <div class="flex-grow"><label>编码 *</label><input id="mat_code" required placeholder="Cr12MoV"></div>
+        <div class="flex-grow"><label>名称 *</label><input id="mat_name" required placeholder="Cr12MoV 冷作模具钢"></div>
+      </div>
+      <div class="flex">
+        <div class="flex-grow">
+          <label>分类</label>
+          <select id="mat_category">
+            <option value="">未分类</option>
+            <option value="cold_work">冷作模具钢</option>
+            <option value="hot_work">热作模具钢</option>
+            <option value="plastic_mold">塑胶模具钢</option>
+            <option value="structural">结构钢</option>
+          </select>
+        </div>
+        <div class="flex-grow"><label>备注</label><input id="mat_remark"></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeModal('materialModal')">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- 图纸上传 modal (简化：上传时填名称) -->
+<div class="modal-bg" id="drawingUploadModal">
+  <div class="modal">
+    <h3>上传图纸到图纸库</h3>
+    <form id="drawingUploadForm" onsubmit="return submitDrawingUpload(event)">
+      <label>文件 *</label>
+      <input type="file" id="du_file" required>
+      <div class="flex">
+        <div class="flex-grow"><label>名称 *</label><input id="du_name" required placeholder="图纸名称"></div>
+        <div class="flex-grow">
+          <label>分类</label>
+          <select id="du_category">
+            <option value="">未分类</option>
+            <option value="mold">模具图</option>
+            <option value="part">零件图</option>
+            <option value="assembly">装配图</option>
+            <option value="other">其他</option>
+          </select>
+        </div>
+      </div>
+      <label>描述</label>
+      <input id="du_desc" placeholder="可选">
+      <label>标签（逗号分隔）</label>
+      <input id="du_tags" placeholder="热处理,线割">
+      <div class="modal-actions">
+        <button type="button" class="secondary" onclick="closeModal('drawingUploadModal')">取消</button>
+        <button type="submit" class="primary">上传</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script src="/static/app.js"></script>
@@ -394,7 +502,7 @@
     t.classList.add('active');
     const tab = t.dataset.tab;
     document.querySelectorAll('.panel').forEach(p => p.style.display = (p.dataset.panel === tab ? '' : 'none'));
-    const loaders = { mat: loadMat, cost: loadCost, eq: loadEq, moq: loadMoq, inv: () => loadInv(_invFilter), sup: loadSup };
+    const loaders = { mat: loadMat, cost: loadCost, eq: loadEq, moq: loadMoq, inv: () => loadInv(_invFilter), sup: loadSup, materials: loadMaterials, drawings: loadDrawings };
     (loaders[tab] || (()=>{}))();
   }));
 
@@ -769,6 +877,147 @@
       showToast(`✓ 已保存 ${_capSelected.size} 项能力`);
       closeModal('capModal');
       loadSup();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
+  };
+
+  // ---------------- 材质字典 ----------------
+  const MAT_CAT_CN = { cold_work:'冷作', hot_work:'热作', plastic_mold:'塑胶', structural:'结构钢' };
+
+  window.loadMaterials = async () => {
+    const r = await App.api('/api/internal/admin/materials');
+    const body = document.getElementById('materialsBody');
+    if (!r.items.length) { body.innerHTML = '<tr><td colspan="6" class="empty">暂无材质</td></tr>'; return; }
+    body.innerHTML = r.items.map(m => `
+      <tr>
+        <td><code>${App.esc(m.code)}</code></td>
+        <td>${App.esc(m.name)}</td>
+        <td>${MAT_CAT_CN[m.category] || m.category || '—'}</td>
+        <td class="muted">${App.esc(m.remark || '—')}</td>
+        <td>${m.is_active ? '<span class="badge" style="background:#065f46;color:#6ee7b7;">启用</span>' : '<span class="badge" style="background:#7f1d1d;color:#fca5a5;">停用</span>'}</td>
+        <td>
+          <button class="secondary" style="padding:3px 8px;font-size:11px;" onclick="editMaterial(${m.id},'${App.esc(m.code)}','${App.esc(m.name)}','${m.category||''}','${App.esc(m.remark||'')}')">编辑</button>
+          <button class="secondary" style="padding:3px 8px;font-size:11px;" onclick="toggleMaterialActive(${m.id},${!m.is_active})">${m.is_active?'停用':'启用'}</button>
+          <button class="danger" style="padding:3px 8px;font-size:11px;" onclick="delMaterial(${m.id},'${App.esc(m.code)}')">删</button>
+        </td>
+      </tr>
+    `).join('');
+  };
+  window.openMaterialModal = () => {
+    document.getElementById('materialModalTitle').textContent = '新增材质';
+    document.getElementById('mat_edit_id').value = '';
+    document.getElementById('mat_code').value = '';
+    document.getElementById('mat_name').value = '';
+    document.getElementById('mat_category').value = '';
+    document.getElementById('mat_remark').value = '';
+    document.getElementById('materialModal').classList.add('show');
+  };
+  window.editMaterial = (id, code, name, cat, remark) => {
+    document.getElementById('materialModalTitle').textContent = '编辑材质';
+    document.getElementById('mat_edit_id').value = id;
+    document.getElementById('mat_code').value = code;
+    document.getElementById('mat_name').value = name;
+    document.getElementById('mat_category').value = cat;
+    document.getElementById('mat_remark').value = remark;
+    document.getElementById('materialModal').classList.add('show');
+  };
+  window.submitMaterial = async (ev) => {
+    ev.preventDefault();
+    const id = document.getElementById('mat_edit_id').value;
+    const body = {
+      code: document.getElementById('mat_code').value.trim(),
+      name: document.getElementById('mat_name').value.trim(),
+      category: document.getElementById('mat_category').value || null,
+      remark: document.getElementById('mat_remark').value.trim() || null,
+    };
+    try {
+      if (id) {
+        await App.api(`/api/internal/admin/materials/${id}`, { method:'PATCH', body });
+      } else {
+        await App.api('/api/internal/admin/materials', { method:'POST', body });
+      }
+      showToast('✓ 已保存');
+      closeModal('materialModal');
+      loadMaterials();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
+    return false;
+  };
+  window.toggleMaterialActive = async (id, newVal) => {
+    await App.api(`/api/internal/admin/materials/${id}`, { method:'PATCH', body:{is_active:newVal} });
+    showToast(newVal ? '✓ 已启用' : '✓ 已停用');
+    loadMaterials();
+  };
+  window.delMaterial = async (id, code) => {
+    if (!confirm(`确定删除材质 ${code}？`)) return;
+    try {
+      await App.api(`/api/internal/admin/materials/${id}`, { method:'DELETE' });
+      showToast('✓ 已删除'); loadMaterials();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
+  };
+
+  // ---------------- 图纸库 ----------------
+  function fmtSize(bytes) {
+    if (!bytes) return '—';
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+    return (bytes/1024/1024).toFixed(1) + ' MB';
+  }
+
+  window.loadDrawings = async () => {
+    const kw = (document.getElementById('drawingQ') || {}).value || '';
+    const cat = (document.getElementById('drawingCatFilter') || {}).value || '';
+    let url = '/api/internal/drawing-library?';
+    if (cat) url += `category=${cat}&`;
+    if (kw.trim()) url += `keyword=${encodeURIComponent(kw.trim())}&`;
+    const r = await App.api(url);
+    const body = document.getElementById('drawingsBody');
+    if (!r.items.length) { body.innerHTML = '<tr><td colspan="7" class="empty">暂无图纸</td></tr>'; return; }
+    body.innerHTML = r.items.map(d => `
+      <tr>
+        <td><b>${App.esc(d.name)}</b></td>
+        <td><code>${App.esc(d.file_name)}</code></td>
+        <td>${App.esc(d.category || '—')}</td>
+        <td>${(d.tags||[]).map(t=>'<span class="badge" style="font-size:10px;padding:1px 6px;margin:1px;">'+App.esc(t)+'</span>').join('')||'—'}</td>
+        <td class="muted">${fmtSize(d.file_size)}</td>
+        <td class="muted">${App.fmtDate(d.created_at)}</td>
+        <td>
+          <a href="/api/internal/drawing-library/${d.id}/download" target="_blank" style="font-size:11px;">下载</a>
+          <button class="danger" style="padding:3px 8px;font-size:11px;" onclick="delDrawing(${d.id},'${App.esc(d.name)}')">删</button>
+        </td>
+      </tr>
+    `).join('');
+  };
+  window.doUploadDrawing = (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    document.getElementById('du_file').files = ev.target.files;
+    document.getElementById('du_name').value = file.name.replace(/\.[^.]+$/, '');
+    document.getElementById('drawingUploadModal').classList.add('show');
+  };
+  window.submitDrawingUpload = async (ev) => {
+    ev.preventDefault();
+    const fileInput = document.getElementById('du_file');
+    const file = fileInput.files[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('name', document.getElementById('du_name').value.trim());
+    fd.append('description', document.getElementById('du_desc').value.trim());
+    fd.append('category', document.getElementById('du_category').value);
+    fd.append('tags', document.getElementById('du_tags').value.trim());
+    try {
+      await App.api('/api/internal/drawing-library', { method:'POST', body:fd });
+      showToast('✓ 图纸已上传');
+      closeModal('drawingUploadModal');
+      document.getElementById('drawingFileInput').value = '';
+      loadDrawings();
+    } catch (e) { showToast('❌ ' + e.message, 'error'); }
+    return false;
+  };
+  window.delDrawing = async (id, name) => {
+    if (!confirm(`确定删除图纸 "${name}"？`)) return;
+    try {
+      await App.api(`/api/internal/drawing-library/${id}`, { method:'DELETE' });
+      showToast('✓ 已删除'); loadDrawings();
     } catch (e) { showToast('❌ ' + e.message, 'error'); }
   };
 

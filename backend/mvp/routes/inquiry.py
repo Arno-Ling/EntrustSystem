@@ -82,6 +82,19 @@ class InquiryQuoteSubmit(BaseModel):
     note: Optional[str] = None
 
 
+class MaterialQuoteLine(BaseModel):
+    inquiry_line_id: int
+    unit_price: float = Field(..., gt=0)
+    lead_time_days: int = Field(..., ge=1)
+    note: Optional[str] = None
+
+
+class MaterialQuoteSubmitMultiLine(BaseModel):
+    """多行材料询价报价：按每行材料分别报价。"""
+    lines: list[MaterialQuoteLine]
+    note: Optional[str] = None
+
+
 class AwardMaterial(BaseModel):
     action: str = Field(..., pattern="^(approve|reject)$")
     comment: Optional[str] = None
@@ -603,28 +616,57 @@ async def get_my_inquiry(
         raise HTTPException(status_code=404)
     if row.get("qty") is not None: row["qty"] = float(row["qty"])
 
-    my_quote = db.fetch_one(
-        "SELECT id, unit_price, lead_time_days, note, submitted_at "
-        "FROM material_quotations WHERE invitation_id=%s",
+    inquiry_id = row["inquiry_id"]
+
+    # 询价行明细
+    inquiry_lines = db.fetch_all(
+        """
+        SELECT id, material_code, material_name, spec, qty, unit, sort_order
+        FROM material_inquiry_lines
+        WHERE inquiry_id = %s
+        ORDER BY sort_order ASC
+        """,
+        (inquiry_id,),
+    )
+    for il in inquiry_lines:
+        if il.get("qty") is not None:
+            il["qty"] = float(il["qty"])
+
+    # 我的报价（可能有多行）
+    my_quotes = db.fetch_all(
+        """
+        SELECT id, inquiry_line_id, unit_price, lead_time_days, note, submitted_at
+        FROM material_quotations WHERE invitation_id=%s
+        ORDER BY inquiry_line_id NULLS FIRST
+        """,
         (inv_id,),
     )
-    if my_quote and my_quote.get("unit_price"):
-        my_quote["unit_price"] = float(my_quote["unit_price"])
-        if my_quote.get("submitted_at"):
-            my_quote["submitted_at"] = my_quote["submitted_at"].isoformat()
+    for q in my_quotes:
+        if q.get("unit_price"):
+            q["unit_price"] = float(q["unit_price"])
+        if q.get("submitted_at"):
+            q["submitted_at"] = q["submitted_at"].isoformat()
 
-    return {"invitation": row, "my_quote": my_quote}
+    # 向后兼容：如果只有一条且 inquiry_line_id=NULL，返回 my_quote 单对象
+    my_quote = my_quotes[0] if my_quotes and len(my_quotes) == 1 and my_quotes[0].get("inquiry_line_id") is None else None
+
+    return {
+        "invitation": row,
+        "inquiry_lines": inquiry_lines,
+        "my_quote": my_quote,
+        "my_quote_lines": my_quotes if inquiry_lines else [],
+    }
 
 
 @material_router.post("/inquiries/{inv_id}/quote")
 async def submit_material_quote(
     inv_id: int,
-    payload: InquiryQuoteSubmit,
+    payload: MaterialQuoteSubmitMultiLine | InquiryQuoteSubmit,
     user: CurrentUser = Depends(_require_material),
 ):
     row = db.fetch_one(
         """
-        SELECT i.*, mi.status AS inquiry_status
+        SELECT i.*, mi.status AS inquiry_status, mi.id AS inquiry_id
         FROM material_inquiry_invitations i
         JOIN material_inquiries mi ON i.inquiry_id = mi.id
         WHERE i.id = %s
@@ -638,28 +680,91 @@ async def submit_material_quote(
                             detail=f"询价单状态 '{row['inquiry_status']}' 不再接受报价")
 
     now = datetime.utcnow()
+    inquiry_id = row["inquiry_id"]
+
+    # 判断是否多行报价模式
+    is_multi_line = hasattr(payload, "lines") and payload.lines
+
     with db.get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO material_quotations
-                    (invitation_id, unit_price, lead_time_days, note, submitted_by, submitted_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
-                ON CONFLICT (invitation_id) DO UPDATE SET
-                    unit_price = EXCLUDED.unit_price,
-                    lead_time_days = EXCLUDED.lead_time_days,
-                    note = EXCLUDED.note,
-                    submitted_by = EXCLUDED.submitted_by,
-                    submitted_at = EXCLUDED.submitted_at
-                """,
-                (inv_id, payload.unit_price, payload.lead_time_days,
-                 payload.note, user.user_id, now),
-            )
+            if is_multi_line:
+                # 多行报价：逐行 upsert
+                # 校验 inquiry_line_id 归属
+                cur.execute(
+                    "SELECT id FROM material_inquiry_lines WHERE inquiry_id = %s",
+                    (inquiry_id,),
+                )
+                valid_line_ids = {r[0] for r in cur.fetchall()}
+                for line in payload.lines:
+                    if line.inquiry_line_id not in valid_line_ids:
+                        raise HTTPException(status_code=400,
+                                            detail=f"报价行引用的询价行 {line.inquiry_line_id} 不属于该询价单")
+
+                # 获取每行的 qty 用于汇总
+                cur.execute(
+                    "SELECT id, qty FROM material_inquiry_lines WHERE inquiry_id = %s",
+                    (inquiry_id,),
+                )
+                qty_map = {r[0]: float(r[1]) for r in cur.fetchall()}
+
+                for line in payload.lines:
+                    cur.execute(
+                        """
+                        INSERT INTO material_quotations
+                            (invitation_id, inquiry_line_id, unit_price, lead_time_days,
+                             note, submitted_by, submitted_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (invitation_id, inquiry_line_id) DO UPDATE SET
+                            unit_price = EXCLUDED.unit_price,
+                            lead_time_days = EXCLUDED.lead_time_days,
+                            note = EXCLUDED.note,
+                            submitted_by = EXCLUDED.submitted_by,
+                            submitted_at = EXCLUDED.submitted_at
+                        """,
+                        (inv_id, line.inquiry_line_id, line.unit_price,
+                         line.lead_time_days, line.note, user.user_id, now),
+                    )
+
+                # 汇总总价 = sum(unit_price * qty)
+                agg_total = sum(
+                    line.unit_price * qty_map.get(line.inquiry_line_id, 1)
+                    for line in payload.lines
+                )
+                agg_lead = max(line.lead_time_days for line in payload.lines)
+
+            else:
+                # 单行报价（向后兼容）
+                cur.execute(
+                    """
+                    INSERT INTO material_quotations
+                        (invitation_id, inquiry_line_id, unit_price, lead_time_days,
+                         note, submitted_by, submitted_at)
+                    VALUES (%s, NULL, %s, %s, %s, %s, %s)
+                    ON CONFLICT (invitation_id, inquiry_line_id) DO UPDATE SET
+                        unit_price = EXCLUDED.unit_price,
+                        lead_time_days = EXCLUDED.lead_time_days,
+                        note = EXCLUDED.note,
+                        submitted_by = EXCLUDED.submitted_by,
+                        submitted_at = EXCLUDED.submitted_at
+                    """,
+                    (inv_id, payload.unit_price, payload.lead_time_days,
+                     payload.note, user.user_id, now),
+                )
+                agg_total = payload.unit_price
+                agg_lead = payload.lead_time_days
+
             cur.execute(
                 "UPDATE material_inquiry_invitations SET invitation_status='quoted', quoted_at=%s WHERE id=%s",
                 (now, inv_id),
             )
-    return {"status": "quoted", "submitted_at": now.isoformat()}
+
+    return {
+        "status": "quoted",
+        "submitted_at": now.isoformat(),
+        "total_price": agg_total,
+        "lead_time_days": agg_lead,
+        "line_count": len(payload.lines) if is_multi_line else 1,
+    }
 
 
 # =============================================================================
